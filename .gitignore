@@ -7,3 +7,5 @@ __pycache__/
 .claude/
 # memoria local do Claude (notas de sessao, nao versionar)
 memory/
+markers.pdf
+svgs/
