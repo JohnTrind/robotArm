@@ -15,14 +15,19 @@ SEGURANCA: o controlo do braco esta DESLIGADO por defeito. Sem --control isto
 so MOSTRA a imagem + overlay (nao mexe nada). Cada comando ao S3 leva &ms (o
 braco para sozinho se o loop de visao parar) e ao sair manda /stopall.
 
+Setup (camara FIXA a ver o braco de fora):
+  marcador ID 0 -> colado na GARRA do braco
+  marcador ID 1 -> colado no OBJETO alvo
+  a base roda ate a garra ficar alinhada (horizontalmente) com o objeto.
+
 Uso:
   python vision.py                       # so preview + overlay (nao mexe o braco)
-  python vision.py --control             # fecha o loop: roda a base p/ centrar
+  python vision.py --control             # fecha o loop: alinha garra->alvo
+  python vision.py --control --invert    # se a base rodar p/ o lado errado
   python vision.py --src 0               # webcam local em vez do Pixel
   python vision.py --list                # imprime IDs ArUco vistos e sai
 
-Marcadores: dicionario 4x4_50. Cola o ID do ALVO (default 0) no objeto.
-Gera/imprime marcadores em https://chev.me/arucogen (4x4, 50).
+Marcadores: dicionario 4x4_50 (gera com make_markers_pdf.py).
 """
 import argparse
 import ssl
@@ -125,8 +130,13 @@ def main():
     ap.add_argument("--src", default=STREAM_URL,
                     help="URL MJPEG (default Pixel) ou indice de webcam (ex: 0)")
     ap.add_argument("--control", action="store_true",
-                    help="FECHA o loop: roda a base p/ centrar o alvo (mexe o braco)")
-    ap.add_argument("--target-id", type=int, default=0, help="ID ArUco do alvo")
+                    help="FECHA o loop: roda a base p/ alinhar garra->alvo (mexe o braco)")
+    ap.add_argument("--gripper-id", type=int, default=0,
+                    help="ID ArUco colado na GARRA (default 0)")
+    ap.add_argument("--target-id", type=int, default=1,
+                    help="ID ArUco colado no OBJETO alvo (default 1)")
+    ap.add_argument("--invert", action="store_true",
+                    help="inverte o sentido da base (se rodar p/ o lado errado)")
     ap.add_argument("--s3", default=S3_BASE, help="base URL do S3")
     ap.add_argument("--list", action="store_true",
                     help="imprime IDs ArUco vistos durante ~3s e sai")
@@ -154,51 +164,62 @@ def main():
         print("[vision] IDs vistos (id: frames):", seen or "nenhum")
         return
 
-    last_state = None
+    moving = False
     try:
         while True:
             frame = grab(kind, handle)
             h, w = frame.shape[:2]
-            cx_frame = w / 2.0
             corners, ids, _ = detector.detectMarkers(frame)
 
-            target = None
+            grip = tgt = None
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(frame, corners, ids)
                 for c, i in zip(corners, ids.flatten()):
-                    if int(i) == args.target_id:
-                        target = c.reshape(4, 2).mean(axis=0)
+                    ctr = c.reshape(4, 2).mean(axis=0)
+                    if int(i) == args.gripper_id:
+                        grip = ctr
+                    elif int(i) == args.target_id:
+                        tgt = ctr
 
-            # linha do centro
-            cv2.line(frame, (int(cx_frame), 0), (int(cx_frame), h), (90, 90, 90), 1)
-
-            state, pct = "sem alvo", 0
-            if target is not None:
-                tx, ty = target
-                dx = (tx - cx_frame) / w        # -0.5..0.5 (fracao da largura)
-                cv2.circle(frame, (int(tx), int(ty)), 8, (0, 215, 255), -1)
-                cv2.line(frame, (int(cx_frame), int(ty)), (int(tx), int(ty)),
-                         (0, 215, 255), 2)
-                if abs(dx) < DEADBAND:
-                    state, pct = "CENTRADO", 0
+            state, pct = "", 0
+            if grip is None and tgt is None:
+                state = "sem garra nem alvo"
+            elif grip is None:
+                state = "falta GARRA (id %d)" % args.gripper_id
+            elif tgt is None:
+                state = "falta ALVO (id %d)" % args.target_id
+            else:
+                # erro = posicao horizontal da garra menos a do alvo
+                err = (grip[0] - tgt[0]) / w     # <0: garra a esq do alvo
+                cv2.circle(frame, (int(grip[0]), int(grip[1])), 8, (60, 255, 60), -1)
+                cv2.circle(frame, (int(tgt[0]), int(tgt[1])), 8, (0, 215, 255), -1)
+                cv2.line(frame, (int(grip[0]), int(grip[1])),
+                         (int(tgt[0]), int(tgt[1])), (200, 200, 0), 2)
+                if abs(err) < DEADBAND:
+                    state, pct = "ALINHADO", 0
                 else:
-                    mag = min(1.0, (abs(dx) - DEADBAND) / (0.5 - DEADBAND))
+                    mag = min(1.0, (abs(err) - DEADBAND) / (0.5 - DEADBAND))
                     speed = int(SPEED_MIN + mag * (SPEED_MAX - SPEED_MIN))
-                    pct = speed if dx > 0 else -speed
-                    state = "alvo a %s -> base %s" % (
-                        "direita" if dx > 0 else "esquerda",
-                        "->" if pct > 0 else "<-")
-                cv2.putText(frame, "dx=%+.2f" % dx, (10, h - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2)
+                    # garra a ESQ do alvo (err<0) -> precisa ir p/ a DIREITA.
+                    # o sentido fisico da base e desconhecido -> --invert ajusta.
+                    direction = 1 if err < 0 else -1
+                    if args.invert:
+                        direction = -direction
+                    pct = direction * speed
+                    state = "garra->alvo  err=%+.2f  base %s" % (
+                        err, "->" if pct > 0 else "<-")
+                cv2.putText(frame, "err=%+.2f" % err, (10, h - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
 
-            # controlo (so com --control); so manda quando o estado muda OU
-            # ha movimento (re-nudge continuo enquanto nao centrado)
+            # controlo (so com --control): re-nudge enquanto desalinhado; ao
+            # alinhar/perder um marcador -> para a base uma vez.
             if args.control:
                 if pct != 0:
                     s3_motor(pct)
-                elif last_state not in (None, "CENTRADO", "sem alvo"):
-                    s3_motor(0)            # acabou de centrar/perder -> para
-                last_state = state
+                    moving = True
+                elif moving:
+                    s3_motor(0)
+                    moving = False
 
             tag = ("CTRL " if args.control else "VER  ") + state
             cv2.putText(frame, tag, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
