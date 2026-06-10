@@ -5,3 +5,5 @@ __pycache__/
 .vscode/
 # tooling de sessao do Claude (skills copiadas de outro projeto)
 .claude/
+# memoria local do Claude (notas de sessao, nao versionar)
+memory/
