@@ -9,3 +9,8 @@ __pycache__/
 memory/
 markers.pdf
 svgs/
+# artefactos de runtime da fase 2 (visao)
+larm_pivot.json
+larm_reach.json
+snap*.png
+snapshot*.png

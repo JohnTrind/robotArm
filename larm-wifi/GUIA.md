@@ -94,20 +94,40 @@ host/larm.py      <- cliente Python (base da fase AI).
 Ferramentas de deploy/debug do C3 (o firmware deles não larga o REPL): `c3/c3_raw.py`,
 `c3/c3_put.py`, `c3/c3_backup.py`, `c3/c3_diag.py`.
 
+## Fase 2 — o braço a VER (autonomia)
+
+A ideia: uma câmara olha para o braço e para um objeto, o PC calcula para onde
+mexer, e manda comandos ao S3. A câmara faz de "olhos" — é o feedback que o
+hardware não tem. Marca-se a garra e o objeto com **marcadores ArUco** (uns
+quadrados de papel; gera com `host/make_markers_pdf.py`, imprime a 100%).
+
+Corre no PC (`host/`):
+- `python vision.py` — só mostra o que reconhece (não mexe o braço).
+- `python vision.py --point` — câmara **de cima**: roda a base até a garra
+  **apontar** ao objeto. Funciona. (Move o objeto → o braço segue.)
+- `python vision.py --reach` — tenta **sobrepor** a garra ao objeto combinando
+  base + juntas. Escrito, ainda por testar bem.
+- `--src 0` usa uma **webcam** em vez do Pixel (recomendado — ver abaixo).
+
+O que aprendemos no hardware:
+- A base e as juntas **seguram a posição** (não caem com o peso). Mas **não há
+  sensor** — o software não sabe o ângulo, só a câmara é que "vê".
+- **Uma câmara fixa vê bem só um plano**: de cima vê a base a rodar; de lado vê
+  as juntas a esticar. O `--reach` contorna isto medindo o que cada atuador faz.
+- **"Apontar/seguir" é fiável; "pegar e largar" não** — sem encoders nas juntas,
+  precisão fina é impossível. É o teto deste braço.
+
 ## Estado / o que ainda falta afinar
 
-- ✅ V1 fechada (2026-06-10): bugs do "continua a rodar" corrigidos (tipo de
-  controlo, neutro da calibração, canal ESP-NOW desencontrado), unicast,
-  watchdog no C3, canal automático, UI nova. Ver `CLAUDE.md > Estado atual`.
-- ⚠️ **Confirmar com a bateria ligada**: largar pára mesmo, sentidos ◀/▶,
-  neutro fino de cada junta (se "zumbir" parada, afinar home via /save).
-- ⚠️ **Bateria** — os servos só têm força pela bateria do braço (o USB alimenta só
-  a lógica). Se "responde ok mas não mexe", é quase sempre bateria fraca → carregar.
-- ❌ **Sem feedback de posição** — não dá saber limites por software (precisaria
-  microswitch/current-sense). "Casa" do braço = batente mecânico (dobrado).
+- ✅ V1 (controlo manual) fechada — UI, failsafe em camadas, canal automático.
+- ✅ Fase 2: pipeline de visão + primitiva "apontar" a funcionar; "alcançar"
+  (jacobiano) escrita. Ver `CLAUDE.md > Fase 2`.
+- ⚠️ **Câmara do Pixel é muito frágil** (Waydroid). Recomendado: **webcam USB**.
+- ❌ **Sem feedback de posição nas juntas** — limite do hardware.
 
 ## Próximos passos possíveis
 
-1. Afinar sentidos/velocidades (flag `inv` por atuador) e animações com juntas.
-2. Fase 2: cérebro (webcam + AI) no Raspberry Pi / Pixel Ubuntu Touch, a falar a
-   mesma API HTTP/WS.
+1. **Webcam USB** em vez do Pixel → destrava a fase 2 (`--src 0`).
+2. Marcadores mais para fora no braço (mais precisão) e em vários ângulos.
+3. **Cérebro Ollama** (local, na RTX 4060) a comandar o "apontar": frame → "vira
+   para o cubo" → chama a primitiva.
