@@ -1,0 +1,7 @@
+# artefactos locais
+larm-wifi.zip
+__pycache__/
+*.pyc
+.vscode/
+# tooling de sessao do Claude (skills copiadas de outro projeto)
+.claude/

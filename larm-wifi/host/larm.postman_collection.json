@@ -1,0 +1,142 @@
+{
+  "info": {
+    "name": "L-ONE Arm (larm)",
+    "description": "Controlo do braco CyberBrick L-ONE via o S3 (app 'larm'). O S3 retransmite por ESP-NOW para o recetor C3 no braco. Define `base_url` = IP do S3 (ex.: http://192.168.1.79).\n\nCONCEITO IMPORTANTE: a base (motor DC) e as juntas (servos continuos) NAO tem sensor de posicao -> os comandos sao VELOCIDADE, nao distancia/angulo. 'pct=50' = rodar a 50% ate parar. Para um movimento FIXO usa '&ms=400' (roda 400ms e para sozinho; distancia ~ velocidade x tempo). A claw (idx3) e o unico posicional (angulo real, sem ms).\n\nO caminho em tempo real e WebSocket (ws://<ip>:81). Estes HTTP sao p/ automacao (base da fase AI).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://192.168.1.79", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "config (GET)",
+      "request": {
+        "method": "GET", "header": [],
+        "url": { "raw": "{{base_url}}/app/larm/config", "host": ["{{base_url}}"], "path": ["app", "larm", "config"] },
+        "description": "servos/motor/canal/WS/contadores."
+      }
+    },
+    {
+      "name": "HOME / parar tudo (GET)",
+      "request": {
+        "method": "GET", "header": [],
+        "url": { "raw": "{{base_url}}/app/larm/home", "host": ["{{base_url}}"], "path": ["app", "larm", "home"] }
+      }
+    },
+    {
+      "name": "Ombro (continua, idx1)  [velocidade x tempo]",
+      "description": "Servo continuo: angulo=velocidade (92~parado). Com &ms faz um nudge fixo e para.",
+      "item": [
+        {
+          "name": "Ombro  <-  nudge (angle 60, 400ms)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/move?idx=1&angle=60&ms=400", "host": ["{{base_url}}"], "path": ["app","larm","move"],
+              "query": [ {"key":"idx","value":"1"}, {"key":"angle","value":"60"}, {"key":"ms","value":"400","description":"roda 400ms e para. Aumenta p/ mover mais."} ] } }
+        },
+        {
+          "name": "Ombro  ->  nudge (angle 120, 400ms)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/move?idx=1&angle=120&ms=400", "host": ["{{base_url}}"], "path": ["app","larm","move"],
+              "query": [ {"key":"idx","value":"1"}, {"key":"angle","value":"120"}, {"key":"ms","value":"400"} ] } }
+        },
+        {
+          "name": "Ombro  STOP",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/stop?idx=1", "host": ["{{base_url}}"], "path": ["app","larm","stop"],
+              "query": [ {"key":"idx","value":"1"} ] } }
+        }
+      ]
+    },
+    {
+      "name": "Cotovelo (continua, idx2)  [velocidade x tempo]",
+      "item": [
+        {
+          "name": "Cotovelo  <-  nudge (angle 60, 400ms)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/move?idx=2&angle=60&ms=400", "host": ["{{base_url}}"], "path": ["app","larm","move"],
+              "query": [ {"key":"idx","value":"2"}, {"key":"angle","value":"60"}, {"key":"ms","value":"400"} ] } }
+        },
+        {
+          "name": "Cotovelo  ->  nudge (angle 120, 400ms)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/move?idx=2&angle=120&ms=400", "host": ["{{base_url}}"], "path": ["app","larm","move"],
+              "query": [ {"key":"idx","value":"2"}, {"key":"angle","value":"120"}, {"key":"ms","value":"400"} ] } }
+        },
+        {
+          "name": "Cotovelo  STOP",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/stop?idx=2", "host": ["{{base_url}}"], "path": ["app","larm","stop"],
+              "query": [ {"key":"idx","value":"2"} ] } }
+        }
+      ]
+    },
+    {
+      "name": "Garra (posicional, idx3)  [angulo real]",
+      "description": "Unico posicional: vai ao angulo e fica. 150=abrir, 30=fechar (sem ms).",
+      "item": [
+        {
+          "name": "Garra  ABRIR (angle 150)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/move?idx=3&angle=150", "host": ["{{base_url}}"], "path": ["app","larm","move"],
+              "query": [ {"key":"idx","value":"3"}, {"key":"angle","value":"150"} ] } }
+        },
+        {
+          "name": "Garra  FECHAR (angle 30)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/move?idx=3&angle=30", "host": ["{{base_url}}"], "path": ["app","larm","move"],
+              "query": [ {"key":"idx","value":"3"}, {"key":"angle","value":"30"} ] } }
+        },
+        {
+          "name": "Garra  MEIO (angle 90)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/move?idx=3&angle=90", "host": ["{{base_url}}"], "path": ["app","larm","move"],
+              "query": [ {"key":"idx","value":"3"}, {"key":"angle","value":"90"} ] } }
+        }
+      ]
+    },
+    {
+      "name": "Base (motor DC, idx1)  [velocidade x tempo]",
+      "description": "Motor DC (yaw). pct -100..100 = velocidade. Com &ms faz um nudge fixo e para. Sem ms, roda ate STOP (ou ate o deadman ~1.5s).",
+      "item": [
+        {
+          "name": "Base  <-  nudge (pct -50, 400ms)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/motor?idx=1&pct=-50&ms=400", "host": ["{{base_url}}"], "path": ["app","larm","motor"],
+              "query": [ {"key":"idx","value":"1"}, {"key":"pct","value":"-50"}, {"key":"ms","value":"400","description":"roda 400ms e para"} ] } }
+        },
+        {
+          "name": "Base  ->  nudge (pct 50, 400ms)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/motor?idx=1&pct=50&ms=400", "host": ["{{base_url}}"], "path": ["app","larm","motor"],
+              "query": [ {"key":"idx","value":"1"}, {"key":"pct","value":"50"}, {"key":"ms","value":"400"} ] } }
+        },
+        {
+          "name": "Base  STOP (pct 0)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/motor?idx=1&pct=0", "host": ["{{base_url}}"], "path": ["app","larm","motor"],
+              "query": [ {"key":"idx","value":"1"}, {"key":"pct","value":"0"} ] } }
+        }
+      ]
+    },
+    {
+      "name": "Animacoes (POST /seq)",
+      "item": [
+        {
+          "name": "Acenar (base + claw)",
+          "request": {
+            "method": "POST",
+            "header": [ {"key":"Content-Type","value":"application/json"} ],
+            "body": { "mode": "raw", "raw": "{\n  \"steps\": [\n    {\"a\":\"m\",\"i\":1,\"v\":50,\"d\":300},\n    {\"a\":\"m\",\"i\":1,\"v\":-50,\"d\":300},\n    {\"a\":\"m\",\"i\":1,\"v\":50,\"d\":300},\n    {\"a\":\"m\",\"i\":1,\"v\":-50,\"d\":300},\n    {\"a\":\"p\",\"i\":3,\"v\":150,\"d\":350},\n    {\"a\":\"p\",\"i\":3,\"v\":30,\"d\":350},\n    {\"a\":\"p\",\"i\":3,\"v\":150,\"d\":350},\n    {\"a\":\"m\",\"i\":1,\"v\":0,\"d\":50}\n  ]\n}" },
+            "url": { "raw": "{{base_url}}/app/larm/seq", "host": ["{{base_url}}"], "path": ["app","larm","seq"] },
+            "description": "Passos: a='p' servo angulo | a='c' continuo roda d ms | a='m' motor d ms | a='w' esperar | a='h' home."
+          }
+        },
+        {
+          "name": "parar sequencia",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/seqstop", "host": ["{{base_url}}"], "path": ["app","larm","seqstop"] } }
+        }
+      ]
+    }
+  ]
+}
