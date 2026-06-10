@@ -1,0 +1,1 @@
+{"servos": {"1": {"home": 92, "max": 150, "min": 30, "name": "Cotovelo", "inv": false}, "2": {"home": 92, "max": 150, "min": 30, "name": "Ombro", "inv": false}, "3": {"home": 30, "max": 110, "min": 30, "name": "Garra", "inv": false}}, "motors": {"1": {"name": "Base", "inv": false}}}
