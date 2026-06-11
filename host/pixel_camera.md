@@ -25,13 +25,26 @@ interna do Waydroid. O relay (raw TCP, o TLS passa transparente) faz a ponte.
 
 ## Arrancar (Pixel por USB, depuração USB ON)
 
+**Num comando (recomendado)** — faz a cadeia TODA (sessão Waydroid + app em
+foreground + relay + forward + teste com retries), com diagnóstico passo a passo:
+
+```bash
+python host/pixel_setup.py                    # setup completo + teste
+python host/pixel_setup.py --status           # só ver o estado de cada elo
+python host/pixel_setup.py --restart-session  # HAL encravado? reinicia o Waydroid
+python host/pixel_setup.py --stop             # desliga relay + forward
+python host/vision.py --point                 # depois disto — ver host/vision.md
+```
+
+À mão (só relay+forward, assume Waydroid+app já a correr):
+
 ```bash
 python host/pixel_cam.py        # arranca relay + adb forward e testa o /stream
-python host/vision.py --point   # (ou outro modo) — ver host/vision.md
 python host/pixel_cam.py --stop # desligar a ponte
 ```
 
-Se o `pixel_cam.py` falhar, segue "Recuperar" abaixo.
+Se falhar, segue "Recuperar" abaixo (o `pixel_setup.py` já automatiza os
+passos 1–3 dessa secção).
 
 ## Recuperar (a sessão / app caíram)
 
