@@ -137,6 +137,92 @@
             "url": { "raw": "{{base_url}}/app/larm/seqstop", "host": ["{{base_url}}"], "path": ["app","larm","seqstop"] } }
         }
       ]
+    },
+    {
+      "name": "Dead reckoning / Poses",
+      "description": "O S3 integra a velocidade comandada -> posicao ESTIMADA por eixo (unidades 'u'; s1/s2=juntas, m1=base, p3=garra em graus reais). Setup: levar o braco a mao a uma referencia e fazer /zero. Poses = snapshot da estimativa; /posego converge em loop fechado sobre a estimativa. A estimativa DERIVA -> re-zerar; reboot do S3 perde-a.",
+      "item": [
+        {
+          "name": "estado (estimativa + poses)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/state", "host": ["{{base_url}}"], "path": ["app","larm","state"] },
+            "description": "{est:{s1,s2,m1,p3}, goto:bool, poses:[nomes]}" }
+        },
+        {
+          "name": "ZERO aqui (calibracao humana)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/zero", "host": ["{{base_url}}"], "path": ["app","larm","zero"] },
+            "description": "Poe a estimativa de todos os eixos a 0 na posicao FISICA atual." }
+        },
+        {
+          "name": "calibrar curso: marcar INICIO (=zero)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/calset?which=min", "host": ["{{base_url}}"], "path": ["app","larm","calset"],
+              "query": [ {"key":"which","value":"min"} ] },
+            "description": "Braco recolhido/inicio do curso. Depois mover ate ao fim e marcar max." }
+        },
+        {
+          "name": "calibrar curso: marcar FIM (esticado)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/calset?which=max", "host": ["{{base_url}}"], "path": ["app","larm","calset"],
+              "query": [ {"key":"which","value":"max"} ] },
+            "description": "Guarda o curso 0..FIM por eixo (persiste). O goto clampa a esta gama. Eixos que nao sairam do zero (<2u) ficam sem limite." }
+        },
+        {
+          "name": "limpar calibracao do curso",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/calclear", "host": ["{{base_url}}"], "path": ["app","larm","calclear"] } }
+        },
+        {
+          "name": "guardar pose atual",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/posesave?name=pegar", "host": ["{{base_url}}"], "path": ["app","larm","posesave"],
+              "query": [ {"key":"name","value":"pegar","description":"a-z 0-9 _ - (max 12)"} ] } }
+        },
+        {
+          "name": "ir para pose",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/posego?name=pegar", "host": ["{{base_url}}"], "path": ["app","larm","posego"],
+              "query": [ {"key":"name","value":"pegar"} ] },
+            "description": "Loop fechado sobre a estimativa; cancela com qualquer comando manual / stopall. Teto 25s." }
+        },
+        {
+          "name": "apagar pose",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/posedel?name=pegar", "host": ["{{base_url}}"], "path": ["app","larm","posedel"],
+              "query": [ {"key":"name","value":"pegar"} ] } }
+        },
+        {
+          "name": "guardar animacao (POST)",
+          "request": {
+            "method": "POST",
+            "header": [ {"key":"Content-Type","value":"application/json"} ],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"rotina1\",\n  \"steps\": [\n    {\"p\": \"ground\", \"d\": 400},\n    {\"p\": \"top\", \"d\": 800}\n  ]\n}" },
+            "url": { "raw": "{{base_url}}/app/larm/animsave", "host": ["{{base_url}}"], "path": ["app","larm","animsave"] },
+            "description": "Encadeia POSES guardadas: vai a cada pose (goto/dead reckoning) e pausa d ms. Max 12 anims x 20 passos." }
+        },
+        {
+          "name": "correr animacao",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/animgo?name=rotina1", "host": ["{{base_url}}"], "path": ["app","larm","animgo"],
+              "query": [ {"key":"name","value":"rotina1"} ] } }
+        },
+        {
+          "name": "apagar animacao",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/animdel?name=rotina1", "host": ["{{base_url}}"], "path": ["app","larm","animdel"],
+              "query": [ {"key":"name","value":"rotina1"} ] } }
+        },
+        {
+          "name": "goto direto (POST, fase AI)",
+          "request": {
+            "method": "POST",
+            "header": [ {"key":"Content-Type","value":"application/json"} ],
+            "body": { "mode": "raw", "raw": "{\n  \"s1\": 0,\n  \"s2\": -10.5,\n  \"m1\": 20,\n  \"p3\": 110\n}" },
+            "url": { "raw": "{{base_url}}/app/larm/goto", "host": ["{{base_url}}"], "path": ["app","larm","goto"] },
+            "description": "Alvo em coordenadas estimadas (u), sem precisar de pose guardada. Chaves opcionais." }
+        }
+      ]
     }
   ]
 }

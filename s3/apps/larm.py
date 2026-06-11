@@ -14,6 +14,14 @@ Atuadores (L-ONE 2.0): idx1/idx2 = servos rotacao CONTINUA (juntas; "angulo" =
 velocidade, ~92 = parado -- largar o botao TEM de voltar ao neutro, senao roda
 para sempre), idx3 = servo posicional (garra), MOTOR1 = motor DC (base/yaw).
 Sem sensores -> sem feedback de posicao.
+
+DEAD RECKONING (v2): o _stream integra a velocidade COMANDADA -> posicao
+ESTIMADA por eixo (unidades arbitrarias "u"; juntas = (sp-home)*s, base =
+pct*s). Calibracao humana: levar o braco a mao a uma referencia e ZERO.
+Poses = snapshot da estimativa (+ angulo real da garra); "ir para pose" e um
+loop fechado sobre a ESTIMATIVA (converge por construcao). A estimativa DERIVA
+(carga, atrito, bateria, modelo linear) -> re-zerar quando preciso; reboot do
+S3 perde a estimativa (refazer ZERO).
 """
 from core.app import App
 from core import display
@@ -40,6 +48,22 @@ _WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 HARD_MIN, HARD_MAX = 30, 150
 HTTP_MS_DEFAULT = 1500   # nudge HTTP sem ms= : roda isto e para (failsafe)
 HTTP_MS_CAP = 3000
+
+# Dead reckoning / goto (todas as defesas existentes continuam por baixo:
+# expiry renovado a cada tick do goto + watchdog do C3).
+# GOTO_SPD = 100: confirmado no hardware que ombro/cotovelo NAO tem forca para
+# levantar em lento/medio -- so a 100% vencem a gravidade. A base fica mais
+# devagar (fine tune da rotacao funciona bem em lento).
+GOTO_SPD = 100       # % de deflexao das juntas durante o goto
+GOTO_PCT = 40        # % do motor base durante o goto
+GOTO_EPS_J = 4.0     # u: chegou (junta)
+GOTO_EPS_M = 4.0     # u: chegou (base)
+GOTO_TICK_MS = 60
+GOTO_CAP_MS = 25000  # teto absoluto de um goto
+POSES_MAX = 16
+ANIMS_MAX = 12
+ANIM_STEPS_MAX = 20
+HOME_POSE = "ground"  # se existir uma pose com este nome, HOME = goto a ela
 
 # (idx, nome, tipo, min, max, home/neutro).
 # tipo: "cont" = rotacao continua (botoes = velocidade; largar = neutro = parar)
@@ -119,6 +143,20 @@ class LArm(App):
         self._msp = {m[0]: 0 for m in MOTORS}
         self._exp = {}     # ('s'/'m', idx) -> deadline ticks_ms do setpoint
         self._burst = {}   # {idx: n} re-envios de posicionais (fiabilidade)
+        # dead reckoning: "s<idx>"/"m<idx>" -> posicao estimada (u)
+        self._est = {"s%d" % i: 0.0 for i, c in self.cfg.items()
+                     if c["type"] == "cont"}
+        for m in MOTORS:
+            self._est["m%d" % m[0]] = 0.0
+        self._odo_t = time.ticks_ms()
+        self._poses = {}
+        self._range = {}   # "s1"/"m1" -> est do FIM do curso (inicio = 0)
+        self._anims = {}   # nome -> [{"p": pose, "d": pausa ms}, ...]
+        self._goto_on = False
+        self._goto_cancel = False
+        self._anim_on = False
+        self._anim_cancel = False
+        self._load_poses()
 
     # --- persistencia da afinacao (larm_cal.json) ---
     def _load_cfg(self):
@@ -164,6 +202,33 @@ class LArm(App):
             return True
         except Exception as e:
             print("[larm] save falhou:", e)
+            return False
+
+    # --- poses (larm_poses.json) ---
+    def _load_poses(self):
+        if not json:
+            return
+        try:
+            with open("larm_poses.json") as f:
+                d = json.load(f)
+            self._poses = d.get("poses", {})
+            self._range = d.get("range", {})
+            self._anims = d.get("anims", {})
+        except OSError:
+            pass
+        except Exception as e:
+            print("[larm] poses invalidas:", e)
+
+    def _save_poses(self):
+        if not json:
+            return False
+        try:
+            with open("larm_poses.json", "w") as f:
+                json.dump({"poses": self._poses, "range": self._range,
+                           "anims": self._anims}, f)
+            return True
+        except Exception as e:
+            print("[larm] save poses falhou:", e)
             return False
 
     # --- ESP-NOW ---
@@ -271,6 +336,11 @@ class LArm(App):
 
     def _home(self):
         self._stop_all()
+        # se o utilizador guardou uma pose HOME_POSE ("ground" = braco
+        # fechado + garra fechada), HOME = ir la por dead reckoning
+        if HOME_POSE in self._poses and self._start_goto(self._poses[HOME_POSE]):
+            self._last = "home>" + HOME_POSE
+            return
         for idx, c in self.cfg.items():
             if c["type"] == "pos":
                 self._set_claw(idx, c["home"])
@@ -306,6 +376,19 @@ class LArm(App):
             await asyncio.sleep_ms(33)
             now = time.ticks_ms()
             tick += 1
+            # dead reckoning: integra a velocidade comandada NESTE momento.
+            # Tudo (WS, HTTP, seq, goto) passa por _sp/_msp -> apanha tudo.
+            dt = time.ticks_diff(now, self._odo_t)
+            self._odo_t = now
+            if 0 < dt <= 250:
+                for idx, c in self.cfg.items():
+                    if c["type"] == "cont":
+                        d = self._sp[idx] - c["home"]
+                        if d:
+                            self._est["s%d" % idx] += d * dt / 1000
+                for midx, v in self._msp.items():
+                    if v:
+                        self._est["m%d" % midx] += v * dt / 1000
             if tick % 8 == 0:
                 # payload do beacon leva o CANAL atual: o C3 ouve-o (mesmo por
                 # fuga de canal adjacente) e tuna direto para o canal certo.
@@ -387,6 +470,7 @@ class LArm(App):
 
     def _ws_cmd(self, msg):
         self._rx += 1
+        self._cancel_auto()        # comando manual > goto/animacao
         try:
             if msg == "h":
                 self._home()
@@ -414,6 +498,10 @@ class LArm(App):
         self._playing = True
         self._seq_cancel = False
         try:
+            for _ in range(40):       # espera um goto a acabar largar
+                if not self._goto_on:
+                    break
+                await asyncio.sleep_ms(50)
             for st in self._seq:
                 if self._seq_cancel:
                     break
@@ -437,6 +525,135 @@ class LArm(App):
             self._stop_all()
             self._playing = False
 
+    # --- goto (loop fechado sobre a posicao ESTIMADA) ---
+    def _cancel_auto(self):
+        """comando manual > tudo o que e automatico (goto + animacao)."""
+        self._goto_cancel = True
+        self._anim_cancel = True
+
+    def _goto_target(self, target):
+        """Filtra/clampa um alvo: {"s1": u, "s2": u, "m1": u, "p3": angulo}."""
+        t = {}
+        for k, v in target.items():
+            try:
+                if k in self._est:
+                    v = float(v)
+                    r = self._range.get(k)   # curso calibrado: 0..fim
+                    if r is not None:
+                        lo, hi = (r, 0.0) if r < 0 else (0.0, r)
+                        v = lo if v < lo else hi if v > hi else v
+                    t[k] = v
+                elif (k[:1] == "p" and int(k[1:]) in self.cfg
+                      and self.cfg[int(k[1:])]["type"] == "pos"):
+                    t[k] = int(v)
+            except Exception:
+                pass
+        return t
+
+    def _start_goto(self, target):
+        t = self._goto_target(target)
+        if not t:
+            return False
+        self._seq_cancel = True
+        self._cancel_auto()
+        try:
+            asyncio.create_task(self._goto(t))
+            return True
+        except Exception as e:
+            print("[larm] goto falhou:", e)
+            return False
+
+    async def _goto(self, target):
+        # espera o goto/seq anterior largar (ja levaram cancel)
+        for _ in range(40):
+            if not self._goto_on and not self._playing:
+                break
+            await asyncio.sleep_ms(50)
+        self._goto_on = True
+        self._goto_cancel = False
+        t0 = time.ticks_ms()
+        try:
+            for i, c in self.cfg.items():
+                if c["type"] == "pos" and ("p%d" % i) in target:
+                    self._set_claw(i, target["p%d" % i])
+            while (not self._goto_cancel and
+                   time.ticks_diff(time.ticks_ms(), t0) < GOTO_CAP_MS):
+                now = time.ticks_ms()
+                busy = False
+                for i, c in self.cfg.items():
+                    if c["type"] != "cont" or ("s%d" % i) not in target:
+                        continue
+                    err = target["s%d" % i] - self._est["s%d" % i]
+                    if err > GOTO_EPS_J or err < -GOTO_EPS_J:
+                        busy = True
+                        d = (c["max"] if err > 0 else c["min"]) - c["home"]
+                        self._sp[i] = _clampi(c["home"] + d * GOTO_SPD // 100,
+                                              HARD_MIN, HARD_MAX)
+                        self._exp[("s", i)] = time.ticks_add(now, 300)
+                    elif self._sp[i] != c["home"]:
+                        self._sp[i] = c["home"]
+                        self._exp[("s", i)] = time.ticks_add(now, 250)
+                for m in self._msp:
+                    if ("m%d" % m) not in target:
+                        continue
+                    err = target["m%d" % m] - self._est["m%d" % m]
+                    if err > GOTO_EPS_M or err < -GOTO_EPS_M:
+                        busy = True
+                        self._msp[m] = GOTO_PCT if err > 0 else -GOTO_PCT
+                        self._exp[("m", m)] = time.ticks_add(now, 300)
+                    elif self._msp[m] != 0:
+                        self._msp[m] = 0
+                        self._exp[("m", m)] = time.ticks_add(now, 250)
+                if not busy:
+                    break
+                await asyncio.sleep_ms(GOTO_TICK_MS)
+            self._last = "goto x" if self._goto_cancel else "goto ok"
+        finally:
+            self._stop_all()
+            self._goto_on = False
+
+    # --- animacoes de poses (goto encadeado + pausas) ---
+    def _start_anim(self, name):
+        steps = self._anims.get(name)
+        if not steps:
+            return False
+        self._seq_cancel = True
+        self._cancel_auto()
+        try:
+            asyncio.create_task(self._anim_run(list(steps)))
+            return True
+        except Exception as e:
+            print("[larm] anim falhou:", e)
+            return False
+
+    async def _anim_run(self, steps):
+        # espera o anterior largar (cancel ja foi pedido em _start_anim)
+        for _ in range(40):
+            if not self._anim_on:
+                break
+            await asyncio.sleep_ms(50)
+        self._anim_on = True
+        self._anim_cancel = False
+        try:
+            for st in steps:
+                if self._anim_cancel:
+                    break
+                p = self._poses.get(st.get("p"))
+                if p:
+                    t = self._goto_target(p)
+                    if t:
+                        await self._goto(t)
+                        if self._goto_cancel:   # cancelado a meio do goto
+                            break
+                d = _clampi(st.get("d", 400), 0, 10000)
+                t0 = time.ticks_ms()
+                while (not self._anim_cancel and
+                       time.ticks_diff(time.ticks_ms(), t0) < d):
+                    await asyncio.sleep_ms(50)
+            self._last = "anim x" if self._anim_cancel else "anim ok"
+        finally:
+            self._anim_on = False
+
     # --- Web ---
     def _take_lcd(self):
         try:
@@ -455,6 +672,8 @@ class LArm(App):
     def on_web(self, method, subpath, params, body):
         self._ensure_ws()
         self._take_lcd()
+        if subpath in ("move", "motor", "stop", "stopall", "home", "seq"):
+            self._cancel_auto()        # comando manual/seq > goto/animacao
         if subpath == "move":
             # garra: vai e fica. Juntas continuas: "angle"=velocidade durante
             # ms (default 1500, cap 3000) e PARA sozinho -- nunca fica a rodar.
@@ -542,8 +761,110 @@ class LArm(App):
             return {"ok": True, "steps": len(self._seq)}
         if subpath == "seqstop":
             self._seq_cancel = True
+            self._cancel_auto()
             self._stop_all()
             return {"ok": True}
+        # --- dead reckoning / poses ---
+        if subpath == "state":
+            est = {k: round(v, 1) for k, v in self._est.items()}
+            for i, c in self.cfg.items():
+                if c["type"] == "pos":
+                    est["p%d" % i] = self._sp[i]
+            return {"est": est, "goto": self._goto_on, "range": self._range,
+                    "anim": self._anim_on,
+                    "poses": sorted(self._poses.keys()),
+                    "anims": sorted(self._anims.keys())}
+        if subpath == "zero":
+            for k in self._est:
+                self._est[k] = 0.0
+            self._last = "zero"
+            return {"ok": True}
+        if subpath == "calset":
+            # which=min: "estou no INICIO do curso" (= zero). which=max:
+            # "estou no FIM (esticado)" -> guarda o curso por eixo. Eixos que
+            # nao sairam do zero (|est|<2u) ficam SEM limite.
+            which = params.get("which", "")
+            if which == "min":
+                for k in self._est:
+                    self._est[k] = 0.0
+                self._last = "cal min"
+                return {"ok": True}
+            if which == "max":
+                for k, v in self._est.items():
+                    if v > 2 or v < -2:
+                        self._range[k] = round(v, 1)
+                    else:
+                        self._range.pop(k, None)
+                self._last = "cal max"
+                return {"ok": self._save_poses(), "range": self._range}
+            return {"ok": False, "err": "which"}
+        if subpath == "calclear":
+            self._range = {}
+            return {"ok": self._save_poses()}
+        if subpath in ("posesave", "posego", "posedel"):
+            name = "".join(ch for ch in str(params.get("name", ""))[:12]
+                           if ch.isalpha() or ch.isdigit() or ch in "_-")
+            if not name:
+                return {"ok": False, "err": "name"}
+            if subpath == "posego":
+                p = self._poses.get(name)
+                if not p:
+                    return {"ok": False, "err": "desconhecida"}
+                return {"ok": self._start_goto(p), "pose": p}
+            if subpath == "posedel":
+                if self._poses.pop(name, None) is None:
+                    return {"ok": False, "err": "desconhecida"}
+                return {"ok": self._save_poses()}
+            if name not in self._poses and len(self._poses) >= POSES_MAX:
+                return {"ok": False, "err": "cheio (max %d)" % POSES_MAX}
+            p = {k: round(v, 1) for k, v in self._est.items()}
+            for i, c in self.cfg.items():
+                if c["type"] == "pos":
+                    p["p%d" % i] = self._sp[i]
+            self._poses[name] = p
+            return {"ok": self._save_poses(), "pose": p}
+        if subpath in ("animsave", "animgo", "animdel"):
+            d0 = {}
+            if subpath == "animsave":
+                # POST {"name":x, "steps":[{"p":"pose","d":pausa_ms}, ...]}
+                if not json:
+                    return {"ok": False}
+                try:
+                    d0 = json.loads(body.decode() if isinstance(
+                        body, (bytes, bytearray)) else body)
+                except Exception as e:
+                    return {"ok": False, "err": str(e)}
+            nm = str(params.get("name", "") or d0.get("name", ""))
+            name = "".join(ch for ch in nm[:12]
+                           if ch.isalpha() or ch.isdigit() or ch in "_-")
+            if not name:
+                return {"ok": False, "err": "name"}
+            if subpath == "animgo":
+                return {"ok": self._start_anim(name)}
+            if subpath == "animdel":
+                if self._anims.pop(name, None) is None:
+                    return {"ok": False, "err": "desconhecida"}
+                return {"ok": self._save_poses()}
+            raw = d0.get("steps", [])
+            steps = [{"p": str(st.get("p", ""))[:12],
+                      "d": _clampi(st.get("d", 400), 0, 10000)}
+                     for st in raw[:ANIM_STEPS_MAX] if st.get("p")]
+            if not steps:
+                return {"ok": False, "err": "steps"}
+            if name not in self._anims and len(self._anims) >= ANIMS_MAX:
+                return {"ok": False, "err": "cheio (max %d)" % ANIMS_MAX}
+            self._anims[name] = steps
+            return {"ok": self._save_poses(), "steps": len(steps)}
+        if subpath == "goto":
+            # POST JSON direto {"s1":u,"s2":u,"m1":u,"p3":ang} (fase AI)
+            if not json:
+                return {"ok": False}
+            try:
+                t = json.loads(body.decode() if isinstance(
+                    body, (bytes, bytearray)) else body)
+            except Exception as e:
+                return {"ok": False, "err": str(e)}
+            return {"ok": self._start_goto(t)}
         return _PAGE
 
     def on_draw(self, lcd):
@@ -581,10 +902,57 @@ input[type=range]{width:100%;height:42px;margin-top:.55rem;touch-action:none}
 .bottom{display:flex;gap:.5rem;margin-top:1rem}
 .bottom button{flex:1;padding:1rem;font-weight:700;border-radius:.6rem;cursor:pointer}
 #sa{background:#d75555;color:#fff;border:none;flex:1.4}
+.tabs{display:flex;gap:.4rem;margin:.2rem 0 .8rem}
+.tabs button{flex:1;padding:.55rem 0;font-size:.8rem;font-weight:700;background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:.5rem;cursor:pointer}
+.tabs button.on{background:var(--primary);color:#fff;border-color:transparent}
+.tab{display:none}
+.tab.on{display:block}
+#est{font-family:ui-monospace,monospace;font-size:.7rem;color:var(--muted);font-weight:400}
+#rl{font-family:ui-monospace,monospace;font-size:.8rem;margin-top:.55rem;line-height:1.6}
+.prow{display:flex;gap:.4rem;margin-top:.5rem}
+.prow button{padding:.5rem .8rem;font-size:.78rem;font-weight:600;border:1px solid var(--border);border-radius:.5rem;background:var(--surface);color:var(--ink);cursor:pointer}
+.prow input{flex:1;min-width:0;padding:.5rem;font-size:.85rem;border:1px solid var(--border);border-radius:.5rem;background:var(--surface);color:var(--ink)}
+.chips{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.55rem}
+.chips button{padding:.45rem .7rem;font-size:.78rem;font-weight:600;background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:.5rem;cursor:pointer}
+.chips button.del{color:#d75555;padding:.45rem .55rem}
+#gst{display:none;font-size:.75rem;font-weight:600;color:var(--primary);margin-top:.5rem}
+.prow select,.prow input[type=number]{padding:.5rem;font-size:.85rem;border:1px solid var(--border);border-radius:.5rem;background:var(--surface);color:var(--ink)}
+.prow select{flex:1;min-width:0}
+.prow input[type=number]{width:5.2rem}
+#asteps{font-family:ui-monospace,monospace;font-size:.75rem;color:var(--muted);margin-top:.55rem;line-height:1.5;word-break:break-word}
 </style>
 <h1>L-ONE <span id="pill"><span class="dot"></span><span id="st">a ligar&hellip;</span></span></h1>
+<div class="tabs"><button id="tb0">Controlo</button><button id="tb1">Poses</button><button id="tb2">Calibra&ccedil;&atilde;o</button></div>
+<div class="tab" id="tab0">
 <section class="card" id="ctl"></section>
 <div class="seg" id="spd"></div>
+</div>
+<div class="tab" id="tab1">
+<section class="card" id="poses">
+<div class="hd"><b>Poses</b><span id="est">&hellip;</span></div>
+<div class="prow"><button id="pz">ZERO aqui</button><input type=text id="pn" placeholder="nome da pose" maxlength=12><button id="ps">Guardar</button></div>
+<div class="chips" id="pl"></div>
+<div id="gst">a ir para a pose&hellip; (STOP TUDO cancela)</div>
+<p class="note" style="margin:.55rem 0 0">dead reckoning: 1) leva o bra&ccedil;o &agrave; m&atilde;o (bot&otilde;es do Controlo) a uma posi&ccedil;&atilde;o de refer&ecirc;ncia &middot; 2) ZERO &middot; 3) move e guarda poses. A estimativa deriva com o uso &mdash; re-zera quando precisares. Reiniciar o S3 perde a estimativa (refaz o ZERO). Uma pose chamada <b>ground</b> passa a ser o destino do bot&atilde;o HOME.</p>
+</section>
+<section class="card">
+<div class="hd"><b>Anima&ccedil;&otilde;es</b><span class="hint">poses encadeadas</span></div>
+<div class="prow"><select id="asel"></select><input type=number id="ad" value="400" min="0" max="10000" step="100" title="pausa depois (ms)"><button id="aadd">+ passo</button></div>
+<div id="asteps">(sem passos)</div>
+<div class="prow"><input type=text id="an" placeholder="nome da anima&ccedil;&atilde;o" maxlength=12><button id="asave">Guardar</button><button id="aclr" style="color:#d75555">limpar</button></div>
+<div class="chips" id="al"></div>
+<p class="note" style="margin:.55rem 0 0">escolhe uma pose, define a pausa (ms) a seguir a ela e "+ passo"; repete e guarda. &#9654; corre a anima&ccedil;&atilde;o (vai pose a pose por dead reckoning). STOP TUDO / qualquer comando manual cancela.</p>
+</section>
+</div>
+<div class="tab" id="tab2">
+<section class="card">
+<div class="hd"><b>Calibra&ccedil;&atilde;o do curso</b></div>
+<div class="prow"><button id="c0">1&middot; marcar IN&Iacute;CIO</button><button id="c1">2&middot; marcar FIM (esticado)</button></div>
+<div id="rl">&hellip;</div>
+<div class="prow"><button id="cx" style="color:#d75555">limpar calibra&ccedil;&atilde;o</button></div>
+<p class="note" style="margin:.55rem 0 0">1) leva o bra&ccedil;o &agrave; m&atilde;o (tab Controlo) &agrave; posi&ccedil;&atilde;o recolhida/in&iacute;cio do curso e marca o IN&Iacute;CIO (= o zero de tudo) &middot; 2) leva-o ao fim do curso (esticado) e marca o FIM. O "ir para pose"/goto passa a n&atilde;o sair de 0..FIM em cada eixo calibrado. Eixos que n&atilde;o mexeste ficam sem limite. A garra tem limites reais pr&oacute;prios (n&atilde;o entra aqui). Depois de reiniciar o S3: volta &agrave; MESMA posi&ccedil;&atilde;o de in&iacute;cio e marca s&oacute; o IN&Iacute;CIO &mdash; o FIM guardado continua v&aacute;lido.</p>
+</section>
+</div>
 <div class="bottom"><button id="sa">STOP TUDO</button><button class="primary" id="hh">HOME</button></div>
 <p class="note">teclado: &larr;/&rarr; base &middot; q/a + w/s juntas &middot; e/d garra &middot; espa&ccedil;o = stop</p>
 <script>
@@ -592,6 +960,7 @@ const $=x=>document.getElementById(x);
 let CFG=[],MOT=[],WSP=81,CH='?',ws=null,ok=false,T0=0,RTT='';
 let HB={},KEY={},KMAP={},GK={};
 let SPD=parseInt(localStorage.larmspd||'60');
+let POSES=[],NM={},ANIMS=[],AS=[];
 function pill(){const p=$('pill');p.className=ok?'ok':'';
   $('st').textContent=ok?('ligado \\u00b7 ch'+CH+(RTT?' \\u00b7 '+RTT:'')):'sem WS \\u00b7 modo HTTP';}
 function wsConnect(){
@@ -627,6 +996,8 @@ async function load(){
   CFG=j.servos;MOT=j.motors||[];WSP=j.ws||81;CH=j.channel;
   pill();render();}
 function render(){
+  NM={};MOT.forEach(m=>NM['m'+m.idx]=m.name);
+  CFG.forEach(s=>NM[(s.type==='cont'?'s':'p')+s.idx]=s.name);
   let h='';
   MOT.forEach(m=>{h+=row(m.name,'b'+m.idx,'gira');});
   CFG.forEach(s=>{if(s.type==='cont')h+=row(s.name,'j'+s.idx,'junta');});
@@ -671,12 +1042,68 @@ function render(){
   const conts=CFG.filter(s=>s.type==='cont');
   const pares=[['KeyQ','KeyA'],['KeyW','KeyS']];
   conts.slice(0,2).forEach((s,n)=>{KMAP[pares[n][0]]='j'+s.idx+'l';KMAP[pares[n][1]]='j'+s.idx+'r';});}
+function typing(e){const t=e.target;return t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA');}
 document.addEventListener('keydown',e=>{
+  if(typing(e))return;  /* a escrever num campo: teclado NAO mexe o braco */
   if(e.code==='Space'){e.preventDefault();stopAll();return;}
   if(GK[e.code]){e.preventDefault();GK[e.code]();return;}
   if(e.repeat)return;
   const id=KMAP[e.code];if(id&&KEY[id]){e.preventDefault();KEY[id].down();}});
-document.addEventListener('keyup',e=>{const id=KMAP[e.code];if(id&&KEY[id])KEY[id].up();});
+document.addEventListener('keyup',e=>{if(typing(e))return;
+  const id=KMAP[e.code];if(id&&KEY[id])KEY[id].up();});
 document.addEventListener('visibilitychange',()=>{if(document.hidden)stopAll();});
-load();wsConnect();
+function drawPoses(){
+  $('pl').innerHTML=POSES.map(p=>'<button data-p="'+p+'">&#9654; '+p+'</button><button class="del" data-d="'+p+'">&times;</button>').join('');
+  $('pl').querySelectorAll('button[data-p]').forEach(b=>b.addEventListener('click',()=>
+    fetch('/app/larm/posego?name='+encodeURIComponent(b.dataset.p)).then(stPoll).catch(()=>{})));
+  $('pl').querySelectorAll('button[data-d]').forEach(b=>b.addEventListener('click',()=>{
+    if(confirm('apagar pose "'+b.dataset.d+'"?'))
+      fetch('/app/larm/posedel?name='+encodeURIComponent(b.dataset.d)).then(stPoll).catch(()=>{});}));
+  const v=$('asel').value;
+  $('asel').innerHTML=POSES.map(p=>'<option>'+p+'</option>').join('');
+  if(POSES.indexOf(v)>=0)$('asel').value=v;}
+function drawSteps(){$('asteps').textContent=AS.length?
+  AS.map(s=>s.p+' ('+s.d+'ms)').join(' \\u2192 '):'(sem passos)';}
+function drawAnims(){
+  $('al').innerHTML=ANIMS.map(a=>'<button data-a="'+a+'">&#9654; '+a+'</button><button class="del" data-x="'+a+'">&times;</button>').join('');
+  $('al').querySelectorAll('button[data-a]').forEach(b=>b.addEventListener('click',()=>
+    fetch('/app/larm/animgo?name='+encodeURIComponent(b.dataset.a)).then(stPoll).catch(()=>{})));
+  $('al').querySelectorAll('button[data-x]').forEach(b=>b.addEventListener('click',()=>{
+    if(confirm('apagar anima\\u00e7\\u00e3o "'+b.dataset.x+'"?'))
+      fetch('/app/larm/animdel?name='+encodeURIComponent(b.dataset.x)).then(stPoll).catch(()=>{});}));}
+async function stPoll(){try{
+  const j=await(await fetch('/app/larm/state')).json();
+  $('est').textContent=Object.keys(j.est).sort().map(k=>(NM[k]||k)+' '+Math.round(j.est[k])).join(' \\u00b7 ');
+  $('gst').style.display=(j.goto||j.anim)?'block':'none';
+  $('gst').textContent=j.anim?'anima\\u00e7\\u00e3o a correr\\u2026 (STOP TUDO cancela)':'a ir para a pose\\u2026 (STOP TUDO cancela)';
+  const rg=j.range||{};
+  $('rl').innerHTML=Object.keys(j.est).sort().filter(k=>k[0]!=='p').map(k=>{
+    const r=rg[k];
+    return (NM[k]||k)+': '+Math.round(j.est[k])+(r==null?' <span style="color:var(--muted)">(sem FIM marcado)</span>':' &middot; curso 0..'+Math.round(r));}).join('<br>');
+  const s=JSON.stringify(j.poses);
+  if(s!==JSON.stringify(POSES)){POSES=j.poses;drawPoses();}
+  const a=JSON.stringify(j.anims||[]);
+  if(a!==JSON.stringify(ANIMS)){ANIMS=j.anims||[];drawAnims();}
+}catch(_){}}
+$('pz').addEventListener('click',()=>fetch('/app/larm/zero').then(stPoll).catch(()=>{}));
+$('ps').addEventListener('click',()=>{const n=$('pn').value.trim();if(!n)return;
+  fetch('/app/larm/posesave?name='+encodeURIComponent(n)).then(()=>{$('pn').value='';stPoll();}).catch(()=>{});});
+$('aadd').addEventListener('click',()=>{const p=$('asel').value;if(!p)return;
+  if(AS.length>=20){alert('max 20 passos');return;}
+  AS.push({p:p,d:Math.max(0,Math.min(10000,parseInt($('ad').value)||0))});drawSteps();});
+$('aclr').addEventListener('click',()=>{AS=[];drawSteps();});
+$('asave').addEventListener('click',()=>{const n=$('an').value.trim();
+  if(!n||!AS.length)return;
+  fetch('/app/larm/animsave',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:n,steps:AS})}).then(()=>{$('an').value='';AS=[];drawSteps();stPoll();}).catch(()=>{});});
+$('c0').addEventListener('click',()=>fetch('/app/larm/calset?which=min').then(stPoll).catch(()=>{}));
+$('c1').addEventListener('click',()=>fetch('/app/larm/calset?which=max').then(stPoll).catch(()=>{}));
+$('cx').addEventListener('click',()=>{if(confirm('limpar a calibra\\u00e7\\u00e3o do curso?'))
+  fetch('/app/larm/calclear').then(stPoll).catch(()=>{});});
+function tab(n){for(let i=0;i<3;i++){$('tb'+i).className=i===n?'on':'';$('tab'+i).className=i===n?'tab on':'tab';}
+  localStorage.larmtab=n;}
+[0,1,2].forEach(i=>$('tb'+i).addEventListener('click',()=>tab(i)));
+tab(parseInt(localStorage.larmtab||'0')||0);
+setInterval(stPoll,800);
+load();wsConnect();stPoll();
 </script>"""
