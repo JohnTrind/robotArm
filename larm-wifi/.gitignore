@@ -1,6 +1,0 @@
-# credenciais reais nunca vão para o git
-config_local.py
-backup_cyberbrick/
-__pycache__/
-*.pyc
-.vscode/

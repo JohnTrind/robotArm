@@ -1,3 +1,7 @@
+# credenciais reais nunca vao para o git
+config_local.py
+# backup do firmware oficial do C3 (nao publicar)
+backup_cyberbrick/
 # artefactos locais
 larm-wifi.zip
 __pycache__/
