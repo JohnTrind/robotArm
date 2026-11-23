@@ -155,23 +155,51 @@
             "description": "Poe a estimativa de todos os eixos a 0 na posicao FISICA atual." }
         },
         {
-          "name": "calibrar curso: marcar INICIO (=zero)",
+          "name": "HOME = posicao atual",
           "request": { "method": "GET", "header": [],
-            "url": { "raw": "{{base_url}}/app/larm/calset?which=min", "host": ["{{base_url}}"], "path": ["app","larm","calset"],
-              "query": [ {"key":"which","value":"min"} ] },
-            "description": "Braco recolhido/inicio do curso. Depois mover ate ao fim e marcar max." }
+            "url": { "raw": "{{base_url}}/app/larm/homeset", "host": ["{{base_url}}"], "path": ["app","larm","homeset"] },
+            "description": "Define a pose HOME (configuravel, persistida). O botao/endpoint /home passa a ir para ela." }
         },
         {
-          "name": "calibrar curso: marcar FIM (esticado)",
+          "name": "ESTOU no home (sync)",
           "request": { "method": "GET", "header": [],
-            "url": { "raw": "{{base_url}}/app/larm/calset?which=max", "host": ["{{base_url}}"], "path": ["app","larm","calset"],
-              "query": [ {"key":"which","value":"max"} ] },
-            "description": "Guarda o curso 0..FIM por eixo (persiste). O goto clampa a esta gama. Eixos que nao sairam do zero (<2u) ficam sem limite." }
+            "url": { "raw": "{{base_url}}/app/larm/homesync", "host": ["{{base_url}}"], "path": ["app","larm","homesync"] },
+            "description": "O braco foi posto FISICAMENTE na pose home (apos reboot/deriva): a estimativa adota as coordenadas do home -> conserta todas as poses de uma vez." }
         },
         {
-          "name": "limpar calibracao do curso",
+          "name": "editar HOME (POST)",
+          "request": {
+            "method": "POST",
+            "header": [ {"key":"Content-Type","value":"application/json"} ],
+            "body": { "mode": "raw", "raw": "{\n  \"vals\": {\"s1\": 0, \"s2\": 0, \"m1\": 0, \"p3\": 30}\n}" },
+            "url": { "raw": "{{base_url}}/app/larm/homesave", "host": ["{{base_url}}"], "path": ["app","larm","homesave"] } }
+        },
+        {
+          "name": "ler pose (valores)",
           "request": { "method": "GET", "header": [],
-            "url": { "raw": "{{base_url}}/app/larm/calclear", "host": ["{{base_url}}"], "path": ["app","larm","calclear"] } }
+            "url": { "raw": "{{base_url}}/app/larm/poseget?name=pegar", "host": ["{{base_url}}"], "path": ["app","larm","poseget"],
+              "query": [ {"key":"name","value":"pegar"} ] } }
+        },
+        {
+          "name": "editar pose (POST vals)",
+          "request": {
+            "method": "POST",
+            "header": [ {"key":"Content-Type","value":"application/json"} ],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"pegar\",\n  \"vals\": {\"s1\": 10.5, \"s2\": -3, \"m1\": 25, \"p3\": 90}\n}" },
+            "url": { "raw": "{{base_url}}/app/larm/posesave", "host": ["{{base_url}}"], "path": ["app","larm","posesave"] } }
+        },
+        {
+          "name": "ler animacao (passos)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/animget?name=rotina1", "host": ["{{base_url}}"], "path": ["app","larm","animget"],
+              "query": [ {"key":"name","value":"rotina1"} ] } }
+        },
+        {
+          "name": "aprender ganho direcional (base)",
+          "request": { "method": "GET", "header": [],
+            "url": { "raw": "{{base_url}}/app/larm/callearn?axis=m1", "host": ["{{base_url}}"], "path": ["app","larm","callearn"],
+              "query": [ {"key":"axis","value":"m1"} ] },
+            "description": "Apos ida-e-volta com regresso FISICO ao inicio: aprende a assimetria do motor (ganho do sentido negativo) e re-zera o eixo. O motor DC nao anda o mesmo p/ cada lado -- isto corrige a odometria." }
         },
         {
           "name": "guardar pose atual",

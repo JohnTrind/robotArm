@@ -56,6 +56,9 @@ HTTP_MS_CAP = 3000
 # devagar (fine tune da rotacao funciona bem em lento).
 GOTO_SPD = 100       # % de deflexao das juntas durante o goto
 GOTO_PCT = 40        # % do motor base durante o goto
+GOTO_PCT_NEAR = 28   # % da base perto do alvo (lento = fine tune, confirmado)
+GOTO_NEAR_U = 10.0   # u: distancia a que a base abranda
+GOTO_BACK_U = 8.0    # u: recuo ALEM do alvo p/ aproximacao final sempre em +
 GOTO_EPS_J = 4.0     # u: chegou (junta)
 GOTO_EPS_M = 4.0     # u: chegou (base)
 GOTO_TICK_MS = 60
@@ -63,7 +66,6 @@ GOTO_CAP_MS = 25000  # teto absoluto de um goto
 POSES_MAX = 16
 ANIMS_MAX = 12
 ANIM_STEPS_MAX = 20
-HOME_POSE = "ground"  # se existir uma pose com este nome, HOME = goto a ela
 
 # (idx, nome, tipo, min, max, home/neutro).
 # tipo: "cont" = rotacao continua (botoes = velocidade; largar = neutro = parar)
@@ -150,8 +152,12 @@ class LArm(App):
             self._est["m%d" % m[0]] = 0.0
         self._odo_t = time.ticks_ms()
         self._poses = {}
-        self._range = {}   # "s1"/"m1" -> est do FIM do curso (inicio = 0)
+        self._home_pose = {}  # pose HOME configuravel (editavel; ref do sync)
         self._anims = {}   # nome -> [{"p": pose, "d": pausa ms}, ...]
+        # assimetria direcional (motor DC nao anda o mesmo p/ cada lado):
+        # ganho aplicado ao sentido NEGATIVO, aprendido por ida-e-volta
+        self._dirgain = {}  # "m1" -> fator (default 1.0)
+        self._acc = {}      # "m1+"/"m1-" -> integral RAW por sentido (p/ aprender)
         self._goto_on = False
         self._goto_cancel = False
         self._anim_on = False
@@ -212,8 +218,9 @@ class LArm(App):
             with open("larm_poses.json") as f:
                 d = json.load(f)
             self._poses = d.get("poses", {})
-            self._range = d.get("range", {})
+            self._home_pose = d.get("home", {})
             self._anims = d.get("anims", {})
+            self._dirgain = d.get("dirgain", {})
         except OSError:
             pass
         except Exception as e:
@@ -224,8 +231,8 @@ class LArm(App):
             return False
         try:
             with open("larm_poses.json", "w") as f:
-                json.dump({"poses": self._poses, "range": self._range,
-                           "anims": self._anims}, f)
+                json.dump({"poses": self._poses, "home": self._home_pose,
+                           "anims": self._anims, "dirgain": self._dirgain}, f)
             return True
         except Exception as e:
             print("[larm] save poses falhou:", e)
@@ -336,10 +343,9 @@ class LArm(App):
 
     def _home(self):
         self._stop_all()
-        # se o utilizador guardou uma pose HOME_POSE ("ground" = braco
-        # fechado + garra fechada), HOME = ir la por dead reckoning
-        if HOME_POSE in self._poses and self._start_goto(self._poses[HOME_POSE]):
-            self._last = "home>" + HOME_POSE
+        # pose HOME configuravel: HOME = ir la por dead reckoning
+        if self._home_pose and self._start_goto(self._home_pose):
+            self._last = "home"
             return
         for idx, c in self.cfg.items():
             if c["type"] == "pos":
@@ -385,10 +391,10 @@ class LArm(App):
                     if c["type"] == "cont":
                         d = self._sp[idx] - c["home"]
                         if d:
-                            self._est["s%d" % idx] += d * dt / 1000
+                            self._integ("s%d" % idx, d * dt / 1000)
                 for midx, v in self._msp.items():
                     if v:
-                        self._est["m%d" % midx] += v * dt / 1000
+                        self._integ("m%d" % midx, v * dt / 1000)
             if tick % 8 == 0:
                 # payload do beacon leva o CANAL atual: o C3 ouve-o (mesmo por
                 # fuga de canal adjacente) e tuna direto para o canal certo.
@@ -439,6 +445,11 @@ class LArm(App):
                          b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
                          b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
             await writer.drain()
+            # browser ligado -> larm toma o LCD. Importante p/ LATENCIA: a
+            # larm e estatica (1 redraw/s); apps animadas (frog) fazem
+            # draw_frame+show() a 15 FPS e cada blit SPI bloqueia o loop
+            # asyncio ~50-150ms -> RTT do WS dispara se ficarem no ecra.
+            self._take_lcd()
             try:
                 sock = getattr(writer, "s", None)
                 if sock is not None:
@@ -455,7 +466,13 @@ class LArm(App):
                     continue
                 if op == 0x1:
                     self._ws_cmd(data.decode())
-                    writer.write(_ws_text_frame("k"))
+                    # ack leva a posicao estimada: coords ao vivo pelo WS
+                    # durante o hold (e o poll HTTP pode abrandar)
+                    try:
+                        pl = "k" + json.dumps(self._snapshot()) if json else "k"
+                    except Exception:
+                        pl = "k"
+                    writer.write(_ws_text_frame(pl))
                     await writer.drain()
         except Exception:
             pass
@@ -525,6 +542,16 @@ class LArm(App):
             self._stop_all()
             self._playing = False
 
+    def _integ(self, k, raw):
+        """integra movimento na estimativa; sentido negativo leva o ganho
+        aprendido. Acumula o RAW por sentido (para o /callearn)."""
+        if raw > 0:
+            self._acc[k + "+"] = self._acc.get(k + "+", 0.0) + raw
+            self._est[k] += raw
+        else:
+            self._acc[k + "-"] = self._acc.get(k + "-", 0.0) - raw
+            self._est[k] += raw * self._dirgain.get(k, 1.0)
+
     # --- goto (loop fechado sobre a posicao ESTIMADA) ---
     def _cancel_auto(self):
         """comando manual > tudo o que e automatico (goto + animacao)."""
@@ -532,23 +559,26 @@ class LArm(App):
         self._anim_cancel = True
 
     def _goto_target(self, target):
-        """Filtra/clampa um alvo: {"s1": u, "s2": u, "m1": u, "p3": angulo}."""
+        """Filtra um alvo: {"s1": u, "s2": u, "m1": u, "p3": angulo}."""
         t = {}
         for k, v in target.items():
             try:
                 if k in self._est:
-                    v = float(v)
-                    r = self._range.get(k)   # curso calibrado: 0..fim
-                    if r is not None:
-                        lo, hi = (r, 0.0) if r < 0 else (0.0, r)
-                        v = lo if v < lo else hi if v > hi else v
-                    t[k] = v
+                    t[k] = float(v)
                 elif (k[:1] == "p" and int(k[1:]) in self.cfg
                       and self.cfg[int(k[1:])]["type"] == "pos"):
                     t[k] = int(v)
             except Exception:
                 pass
         return t
+
+    def _snapshot(self):
+        """pose = estimativa atual + angulo real da garra."""
+        p = {k: round(v, 1) for k, v in self._est.items()}
+        for i, c in self.cfg.items():
+            if c["type"] == "pos":
+                p["p%d" % i] = self._sp[i]
+        return p
 
     def _start_goto(self, target):
         t = self._goto_target(target)
@@ -572,6 +602,14 @@ class LArm(App):
         self._goto_on = True
         self._goto_cancel = False
         t0 = time.ticks_ms()
+        # base: se o alvo esta ATRAS, recuar GOTO_BACK_U alem dele e chegar
+        # sempre no sentido + (mata folga/assimetria do motor DC). rev[m]=True
+        # enquanto estiver na fase de recuo.
+        rev = {}
+        for m in self._msp:
+            k = "m%d" % m
+            if k in target and target[k] < self._est[k] - GOTO_EPS_M:
+                rev[m] = True
         try:
             for i, c in self.cfg.items():
                 if c["type"] == "pos" and ("p%d" % i) in target:
@@ -594,13 +632,26 @@ class LArm(App):
                         self._sp[i] = c["home"]
                         self._exp[("s", i)] = time.ticks_add(now, 250)
                 for m in self._msp:
-                    if ("m%d" % m) not in target:
+                    k = "m%d" % m
+                    if k not in target:
                         continue
-                    err = target["m%d" % m] - self._est["m%d" % m]
-                    if err > GOTO_EPS_M or err < -GOTO_EPS_M:
+                    err = target[k] - self._est[k]
+                    if rev.get(m):
+                        # fase recuo: passar GOTO_BACK_U alem do alvo
+                        if err < GOTO_BACK_U:
+                            busy = True
+                            self._msp[m] = -GOTO_PCT
+                            self._exp[("m", m)] = time.ticks_add(now, 300)
+                            continue
+                        rev[m] = False    # ja atras -> aproximacao em +
+                    if err > GOTO_EPS_M:
                         busy = True
-                        self._msp[m] = GOTO_PCT if err > 0 else -GOTO_PCT
+                        self._msp[m] = (GOTO_PCT if err > GOTO_NEAR_U
+                                        else GOTO_PCT_NEAR)
                         self._exp[("m", m)] = time.ticks_add(now, 300)
+                    elif err < -GOTO_EPS_M:   # passou-se: recua outra vez
+                        rev[m] = True
+                        busy = True
                     elif self._msp[m] != 0:
                         self._msp[m] = 0
                         self._exp[("m", m)] = time.ticks_add(now, 250)
@@ -671,7 +722,8 @@ class LArm(App):
 
     def on_web(self, method, subpath, params, body):
         self._ensure_ws()
-        self._take_lcd()
+        if subpath != "state":     # o poll de estado nao rouba o LCD
+            self._take_lcd()
         if subpath in ("move", "motor", "stop", "stopall", "home", "seq"):
             self._cancel_auto()        # comando manual/seq > goto/animacao
         if subpath == "move":
@@ -770,42 +822,88 @@ class LArm(App):
             for i, c in self.cfg.items():
                 if c["type"] == "pos":
                     est["p%d" % i] = self._sp[i]
-            return {"est": est, "goto": self._goto_on, "range": self._range,
-                    "anim": self._anim_on,
-                    "poses": sorted(self._poses.keys()),
-                    "anims": sorted(self._anims.keys())}
+            return {"est": est, "goto": self._goto_on, "home": self._home_pose,
+                    "anim": self._anim_on, "gain": self._dirgain,
+                    "poses": sorted(self._poses.keys(), key=lambda s: s.lower()),
+                    "anims": sorted(self._anims.keys(), key=lambda s: s.lower())}
         if subpath == "zero":
             for k in self._est:
                 self._est[k] = 0.0
+            self._acc = {}
             self._last = "zero"
             return {"ok": True}
-        if subpath == "calset":
-            # which=min: "estou no INICIO do curso" (= zero). which=max:
-            # "estou no FIM (esticado)" -> guarda o curso por eixo. Eixos que
-            # nao sairam do zero (|est|<2u) ficam SEM limite.
-            which = params.get("which", "")
-            if which == "min":
-                for k in self._est:
-                    self._est[k] = 0.0
-                self._last = "cal min"
-                return {"ok": True}
-            if which == "max":
-                for k, v in self._est.items():
-                    if v > 2 or v < -2:
-                        self._range[k] = round(v, 1)
-                    else:
-                        self._range.pop(k, None)
-                self._last = "cal max"
-                return {"ok": self._save_poses(), "range": self._range}
-            return {"ok": False, "err": "which"}
-        if subpath == "calclear":
-            self._range = {}
-            return {"ok": self._save_poses()}
-        if subpath in ("posesave", "posego", "posedel"):
-            name = "".join(ch for ch in str(params.get("name", ""))[:12]
+        if subpath == "callearn":
+            # ida-e-volta: o utilizador voltou a por o eixo FISICAMENTE no
+            # inicio. Num caminho fechado a distancia real e igual nos 2
+            # sentidos -> ganho do sentido negativo = raw+ / raw-.
+            k = str(params.get("axis", "m1"))
+            if k not in self._est:
+                return {"ok": False, "err": "axis"}
+            p = self._acc.get(k + "+", 0.0)
+            n = self._acc.get(k + "-", 0.0)
+            if p < 5 or n < 5:
+                return {"ok": False,
+                        "err": "anda primeiro (ida e volta; +%.0f/-%.0f)" % (p, n)}
+            g = p / n
+            if g < 0.4 or g > 2.5:
+                return {"ok": False, "err": "razao %.2f estranha -- refaz" % g}
+            self._dirgain[k] = round(g, 3)
+            self._est[k] = 0.0          # esta fisicamente no inicio
+            self._acc.pop(k + "+", None)
+            self._acc.pop(k + "-", None)
+            self._last = "gain %s=%.2f" % (k, g)
+            return {"ok": self._save_poses(), "axis": k, "gain": self._dirgain[k]}
+        if subpath == "homeset":
+            # "a pose HOME passa a ser ESTA posicao"
+            self._home_pose = self._snapshot()
+            return {"ok": self._save_poses(), "home": self._home_pose}
+        if subpath == "homesync":
+            # "pus o braco FISICAMENTE na pose home" -> o software adota as
+            # coordenadas do home (substitui o antigo ZERO; conserta todas as
+            # poses de uma vez porque partilham o referencial)
+            if not self._home_pose:
+                return {"ok": False, "err": "define o HOME primeiro"}
+            for k in self._est:
+                if k in self._home_pose:
+                    try:
+                        self._est[k] = float(self._home_pose[k])
+                    except Exception:
+                        pass
+            self._acc = {}
+            self._last = "sync"
+            return {"ok": True}
+        if subpath == "homesave":
+            # POST {"vals": {...}} -- editar os valores do home a mao
+            if not json:
+                return {"ok": False}
+            try:
+                vals = json.loads(body.decode() if isinstance(
+                    body, (bytes, bytearray)) else body).get("vals", {})
+            except Exception as e:
+                return {"ok": False, "err": str(e)}
+            t = self._goto_target(vals)
+            if not t:
+                return {"ok": False, "err": "vals"}
+            self._home_pose = t
+            return {"ok": self._save_poses(), "home": self._home_pose}
+        if subpath in ("posesave", "posego", "posedel", "poseget"):
+            d0 = {}
+            if subpath == "posesave" and body:
+                # POST {"name":x, "vals":{...}} = editar valores a mao;
+                # sem body (GET) = snapshot da posicao atual
+                try:
+                    d0 = json.loads(body.decode() if isinstance(
+                        body, (bytes, bytearray)) else body)
+                except Exception:
+                    d0 = {}
+            nm = str(params.get("name", "") or d0.get("name", ""))
+            name = "".join(ch for ch in nm[:12]
                            if ch.isalpha() or ch.isdigit() or ch in "_-")
             if not name:
                 return {"ok": False, "err": "name"}
+            if subpath == "poseget":
+                p = self._poses.get(name)
+                return {"ok": p is not None, "name": name, "pose": p or {}}
             if subpath == "posego":
                 p = self._poses.get(name)
                 if not p:
@@ -817,13 +915,15 @@ class LArm(App):
                 return {"ok": self._save_poses()}
             if name not in self._poses and len(self._poses) >= POSES_MAX:
                 return {"ok": False, "err": "cheio (max %d)" % POSES_MAX}
-            p = {k: round(v, 1) for k, v in self._est.items()}
-            for i, c in self.cfg.items():
-                if c["type"] == "pos":
-                    p["p%d" % i] = self._sp[i]
+            if d0.get("vals"):
+                p = self._goto_target(d0["vals"])
+                if not p:
+                    return {"ok": False, "err": "vals"}
+            else:
+                p = self._snapshot()
             self._poses[name] = p
             return {"ok": self._save_poses(), "pose": p}
-        if subpath in ("animsave", "animgo", "animdel"):
+        if subpath in ("animsave", "animgo", "animdel", "animget"):
             d0 = {}
             if subpath == "animsave":
                 # POST {"name":x, "steps":[{"p":"pose","d":pausa_ms}, ...]}
@@ -839,6 +939,9 @@ class LArm(App):
                            if ch.isalpha() or ch.isdigit() or ch in "_-")
             if not name:
                 return {"ok": False, "err": "name"}
+            if subpath == "animget":
+                st = self._anims.get(name)
+                return {"ok": st is not None, "name": name, "steps": st or []}
             if subpath == "animgo":
                 return {"ok": self._start_anim(name)}
             if subpath == "animdel":
@@ -882,85 +985,122 @@ class LArm(App):
                             8, y + 6, lcd.color(150, 150, 150), scale=1)
 
 
-_PAGE = """<style>
-h1{font-size:1.05rem;font-weight:700;margin:.1rem 0 .7rem;display:flex;justify-content:space-between;align-items:center;gap:.5rem}
-#pill{font-size:.72rem;font-weight:600;padding:.3rem .65rem;border-radius:999px;background:var(--surface);border:1px solid var(--border);white-space:nowrap}
-#pill .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:#d75555;margin-right:.35rem;vertical-align:middle}
-#pill.ok .dot{background:var(--accent-green)}
-.ctl{margin:.75rem 0}
-.hd{display:flex;justify-content:space-between;align-items:baseline;font-weight:600;margin-bottom:.4rem}
-.hint{font-size:.7rem;color:var(--muted);font-weight:400}
-.btns{display:flex;gap:.5rem}
-.btns button{flex:1;min-height:64px;font-size:1.45rem;line-height:1;background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:.6rem;box-shadow:var(--shadow);touch-action:none;user-select:none;-webkit-user-select:none;cursor:pointer}
-.btns button.on{background:var(--primary);color:#fff;border-color:transparent}
-.btns button.stp{flex:.55;font-size:1.1rem}
-.val{font-family:ui-monospace,monospace;font-weight:700;color:var(--primary)}
-input[type=range]{width:100%;height:42px;margin-top:.55rem;touch-action:none}
-.seg{display:flex;gap:.4rem;margin:.9rem 0 0}
-.seg button{flex:1;padding:.6rem 0;font-size:.78rem;font-weight:600;background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:.5rem;cursor:pointer}
-.seg button.on{background:var(--primary);color:#fff;border-color:transparent}
-.bottom{display:flex;gap:.5rem;margin-top:1rem}
-.bottom button{flex:1;padding:1rem;font-weight:700;border-radius:.6rem;cursor:pointer}
-#sa{background:#d75555;color:#fff;border:none;flex:1.4}
-.tabs{display:flex;gap:.4rem;margin:.2rem 0 .8rem}
-.tabs button{flex:1;padding:.55rem 0;font-size:.8rem;font-weight:700;background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:.5rem;cursor:pointer}
-.tabs button.on{background:var(--primary);color:#fff;border-color:transparent}
-.tab{display:none}
-.tab.on{display:block}
-#est{font-family:ui-monospace,monospace;font-size:.7rem;color:var(--muted);font-weight:400}
-#rl{font-family:ui-monospace,monospace;font-size:.8rem;margin-top:.55rem;line-height:1.6}
-.prow{display:flex;gap:.4rem;margin-top:.5rem}
-.prow button{padding:.5rem .8rem;font-size:.78rem;font-weight:600;border:1px solid var(--border);border-radius:.5rem;background:var(--surface);color:var(--ink);cursor:pointer}
-.prow input{flex:1;min-width:0;padding:.5rem;font-size:.85rem;border:1px solid var(--border);border-radius:.5rem;background:var(--surface);color:var(--ink)}
-.chips{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.55rem}
-.chips button{padding:.45rem .7rem;font-size:.78rem;font-weight:600;background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:.5rem;cursor:pointer}
-.chips button.del{color:#d75555;padding:.45rem .55rem}
-#gst{display:none;font-size:.75rem;font-weight:600;color:var(--primary);margin-top:.5rem}
-.prow select,.prow input[type=number]{padding:.5rem;font-size:.85rem;border:1px solid var(--border);border-radius:.5rem;background:var(--surface);color:var(--ink)}
-.prow select{flex:1;min-width:0}
-.prow input[type=number]{width:5.2rem}
-#asteps{font-family:ui-monospace,monospace;font-size:.75rem;color:var(--muted);margin-top:.55rem;line-height:1.5;word-break:break-word}
+_PAGE = """<!doctype html><html lang="pt"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#131210">
+<title>L-ONE</title>
+</head><body>
+<style>
+/* paleta retro americana: creme #e8d8c9 / azul #4b607f / laranja #f3701e */
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{--bg:#131210;--card:#211e1a;--cream:#e8d8c9;--blue:#4b607f;--orange:#f3701e;--ink:#17150f;--muted:#9a8f81}
+body{margin:0;background:var(--bg);color:var(--cream);font-family:-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;-webkit-font-smoothing:antialiased}
+main{max-width:540px;margin:0 auto;padding:14px 14px 112px}
+header{display:flex;justify-content:space-between;align-items:center;margin:8px 2px 16px}
+h1{font-size:1.85rem;font-weight:900;letter-spacing:-.045em;margin:0;color:var(--cream)}
+h1 i{font-style:normal;color:var(--orange)}
+#pill{font-size:.68rem;font-weight:700;letter-spacing:.02em;padding:.5rem .85rem;border-radius:999px;background:var(--card);color:var(--cream);white-space:nowrap}
+#pill .dot{display:inline-block;width:.55rem;height:.55rem;border-radius:50%;background:var(--orange);margin-right:.4rem;vertical-align:middle}
+#pill.ok .dot{background:#9bb167}
+.tabs{display:flex;gap:6px;background:var(--card);padding:6px;border-radius:18px;margin-bottom:14px}
+.tabs button{flex:1;padding:.72rem 0;font-size:.74rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;background:transparent;color:var(--muted);border:none;border-radius:13px;cursor:pointer}
+.tabs button.on{background:var(--cream);color:var(--ink)}
+.tab{display:none}.tab.on{display:block}
+.ck{border-radius:22px;padding:16px;margin-bottom:12px}
+.ck-c{background:var(--cream);color:var(--ink)}
+.ck-b{background:var(--blue);color:var(--cream)}
+.ck-o{background:var(--orange);color:var(--ink)}
+.hd{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.75rem}
+.hd b{font-size:1.02rem;font-weight:900;letter-spacing:.01em;text-transform:uppercase}
+.hint{font-size:.62rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;opacity:.55}
+.btns{display:flex;gap:10px}
+.btns button{flex:1;min-height:68px;font-size:1.5rem;line-height:1;font-weight:900;background:var(--ink);color:var(--cream);border:none;border-radius:16px;cursor:pointer;touch-action:none;user-select:none;-webkit-user-select:none;transition:transform .05s,background .08s}
+.btns button:active{transform:scale(.96)}
+.btns button.on{background:var(--orange);color:var(--ink)}
+.ck-o .btns button.on{background:var(--cream)}
+.ck-o .btns button{font-size:1rem;letter-spacing:.05em;text-transform:uppercase;font-weight:800}
+.val{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:800;font-size:1.2rem}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:48px;background:transparent;margin-top:8px;touch-action:none}
+input[type=range]::-webkit-slider-runnable-track{height:14px;border-radius:8px;background:var(--ink)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:34px;height:34px;border-radius:50%;background:var(--cream);border:5px solid var(--ink);margin-top:-10px}
+input[type=range]::-moz-range-track{height:14px;border-radius:8px;background:var(--ink)}
+input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;background:var(--cream);border:5px solid var(--ink)}
+.seg{display:flex;gap:6px;background:var(--card);padding:6px;border-radius:16px;margin-bottom:12px}
+.seg button{flex:1;padding:.72rem 0;font-size:.72rem;font-weight:800;letter-spacing:.05em;text-transform:uppercase;background:transparent;color:var(--muted);border:none;border-radius:11px;cursor:pointer}
+.seg button.on{background:var(--blue);color:var(--cream)}
+.bottom{position:fixed;left:0;right:0;bottom:0;z-index:9;display:flex;gap:10px;max-width:540px;margin:0 auto;padding:14px 14px calc(14px + env(safe-area-inset-bottom));background:linear-gradient(transparent,var(--bg) 40%);pointer-events:none}
+.bottom button{flex:1;padding:1.05rem 0;font-size:.95rem;font-weight:900;letter-spacing:.05em;text-transform:uppercase;border:none;border-radius:18px;cursor:pointer;pointer-events:auto}
+#sa{background:var(--orange);color:var(--ink);flex:1.4;box-shadow:0 6px 26px rgba(243,112,30,.4)}
+#hh{background:var(--cream);color:var(--ink)}
+.prow{display:flex;gap:8px;margin-top:10px}
+.prow button{padding:.7rem .9rem;font-size:.76rem;font-weight:800;letter-spacing:.02em;border:none;border-radius:12px;background:var(--ink);color:var(--cream);cursor:pointer;white-space:nowrap}
+.prow button.del{background:transparent;border:2px solid currentColor;color:inherit;opacity:.55}
+.prow input,.prow select{flex:1;min-width:0;padding:.65rem .75rem;font-size:.92rem;font-weight:600;border:none;border-radius:12px;background:rgba(0,0,0,.18);color:inherit}
+.ck-c .prow input,.ck-c .prow select{background:rgba(23,21,15,.09)}
+.prow input::placeholder{color:inherit;opacity:.45}
+.prow input[type=number]{flex:0 0 5.4rem}
+.list{margin-top:12px}
+.li{display:flex;align-items:center;gap:8px;background:rgba(0,0,0,.18);border-radius:13px;padding:8px 10px;margin-bottom:8px}
+.ck-c .li{background:rgba(23,21,15,.09)}
+.li b{flex:1;font-size:.95rem;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.li button{border:none;border-radius:10px;background:var(--ink);color:var(--cream);font-weight:800;font-size:.95rem;padding:.55rem .85rem;cursor:pointer}
+.li button.sm{background:transparent;border:2px solid currentColor;color:inherit;opacity:.5;font-size:.74rem;padding:.42rem .6rem}
+.dt{background:rgba(0,0,0,.18);border-radius:13px;padding:11px 12px;margin:-2px 0 10px}
+.ck-c .dt{background:rgba(23,21,15,.09)}
+.kv{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.kv label{display:flex;align-items:center;gap:7px;font-size:.66rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;opacity:.85}
+.kv input{flex:1;width:100%;min-width:0;padding:.5rem .6rem;font-size:.92rem;font-weight:700;border:none;border-radius:10px;background:rgba(0,0,0,.2);color:inherit;font-family:ui-monospace,Menlo,Consolas,monospace}
+.ck-c .kv input{background:rgba(23,21,15,.1)}
+.mono,#asteps{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8rem;margin-top:10px;line-height:1.7;background:rgba(0,0,0,.16);padding:10px 13px;border-radius:12px;word-break:break-word}
+#gst{display:none;position:fixed;left:50%;transform:translateX(-50%);bottom:96px;z-index:8;padding:.7rem 1rem;border-radius:14px;background:var(--ink);color:var(--orange);font-size:.78rem;font-weight:800;white-space:nowrap;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.note{font-size:.72rem;line-height:1.5;opacity:.6;margin:.65rem 2px 0}
 </style>
-<h1>L-ONE <span id="pill"><span class="dot"></span><span id="st">a ligar&hellip;</span></span></h1>
-<div class="tabs"><button id="tb0">Controlo</button><button id="tb1">Poses</button><button id="tb2">Calibra&ccedil;&atilde;o</button></div>
+<main>
+<header><h1>L<i>&middot;</i>ONE</h1><span id="pill"><span class="dot"></span><span id="st">a ligar&hellip;</span></span></header>
+<div class="tabs"><button id="tb0">Controlo</button><button id="tb1">Poses</button><button id="tb2">Anima&ccedil;&otilde;es</button></div>
 <div class="tab" id="tab0">
-<section class="card" id="ctl"></section>
 <div class="seg" id="spd"></div>
+<div class="mono" id="cpos2" style="margin:0 0 12px">&hellip;</div>
+<div id="ctl"></div>
 </div>
 <div class="tab" id="tab1">
-<section class="card" id="poses">
-<div class="hd"><b>Poses</b><span id="est">&hellip;</span></div>
-<div class="prow"><button id="pz">ZERO aqui</button><input type=text id="pn" placeholder="nome da pose" maxlength=12><button id="ps">Guardar</button></div>
-<div class="chips" id="pl"></div>
-<div id="gst">a ir para a pose&hellip; (STOP TUDO cancela)</div>
-<p class="note" style="margin:.55rem 0 0">dead reckoning: 1) leva o bra&ccedil;o &agrave; m&atilde;o (bot&otilde;es do Controlo) a uma posi&ccedil;&atilde;o de refer&ecirc;ncia &middot; 2) ZERO &middot; 3) move e guarda poses. A estimativa deriva com o uso &mdash; re-zera quando precisares. Reiniciar o S3 perde a estimativa (refaz o ZERO). Uma pose chamada <b>ground</b> passa a ser o destino do bot&atilde;o HOME.</p>
+<section class="ck ck-b">
+<div class="hd"><b>Home</b><span class="hint">pose de arranque</span></div>
+<div class="mono" id="cpos">&hellip;</div>
+<div class="prow"><button id="hsync">ESTOU no home</button><button id="hset">home = aqui</button><button id="hedit" class="del">editar</button></div>
+<div class="dt" id="hdt" style="display:none;margin-top:10px"></div>
+<p class="note" style="margin:.55rem 0 0">o bot&atilde;o HOME vai para esta pose. <b>ESTOU no home</b> = puseste o bra&ccedil;o fisicamente nela (ex.: depois de reiniciar o S3, ou quando a estimativa derivou) e o software adota essas coordenadas &mdash; conserta todas as poses de uma vez, porque partilham o referencial.</p>
 </section>
-<section class="card">
-<div class="hd"><b>Anima&ccedil;&otilde;es</b><span class="hint">poses encadeadas</span></div>
-<div class="prow"><select id="asel"></select><input type=number id="ad" value="400" min="0" max="10000" step="100" title="pausa depois (ms)"><button id="aadd">+ passo</button></div>
-<div id="asteps">(sem passos)</div>
-<div class="prow"><input type=text id="an" placeholder="nome da anima&ccedil;&atilde;o" maxlength=12><button id="asave">Guardar</button><button id="aclr" style="color:#d75555">limpar</button></div>
-<div class="chips" id="al"></div>
-<p class="note" style="margin:.55rem 0 0">escolhe uma pose, define a pausa (ms) a seguir a ela e "+ passo"; repete e guarda. &#9654; corre a anima&ccedil;&atilde;o (vai pose a pose por dead reckoning). STOP TUDO / qualquer comando manual cancela.</p>
+<section class="ck ck-c" id="poses">
+<div class="hd"><b>Poses</b><span class="hint">ir &middot; editar &middot; apagar</span></div>
+<div class="prow"><input type=text id="pn" placeholder="nome da pose" maxlength=12><button id="ps">guardar atual</button></div>
+<div class="list" id="pl"></div>
 </section>
 </div>
 <div class="tab" id="tab2">
-<section class="card">
-<div class="hd"><b>Calibra&ccedil;&atilde;o do curso</b></div>
-<div class="prow"><button id="c0">1&middot; marcar IN&Iacute;CIO</button><button id="c1">2&middot; marcar FIM (esticado)</button></div>
-<div id="rl">&hellip;</div>
-<div class="prow"><button id="cx" style="color:#d75555">limpar calibra&ccedil;&atilde;o</button></div>
-<p class="note" style="margin:.55rem 0 0">1) leva o bra&ccedil;o &agrave; m&atilde;o (tab Controlo) &agrave; posi&ccedil;&atilde;o recolhida/in&iacute;cio do curso e marca o IN&Iacute;CIO (= o zero de tudo) &middot; 2) leva-o ao fim do curso (esticado) e marca o FIM. O "ir para pose"/goto passa a n&atilde;o sair de 0..FIM em cada eixo calibrado. Eixos que n&atilde;o mexeste ficam sem limite. A garra tem limites reais pr&oacute;prios (n&atilde;o entra aqui). Depois de reiniciar o S3: volta &agrave; MESMA posi&ccedil;&atilde;o de in&iacute;cio e marca s&oacute; o IN&Iacute;CIO &mdash; o FIM guardado continua v&aacute;lido.</p>
+<section class="ck ck-c">
+<div class="hd"><b>Nova</b><span class="hint">poses encadeadas</span></div>
+<div class="prow"><select id="asel"></select><input type=number id="ad" value="400" min="0" max="10000" step="100" title="pausa depois (ms)"><button id="aadd">+ passo</button></div>
+<div id="asteps">(sem passos)</div>
+<div class="prow"><input type=text id="an" placeholder="nome da anima&ccedil;&atilde;o" maxlength=12><button id="asave">guardar</button><button id="aclr" class="del">limpar</button></div>
+<p class="note" style="margin:.55rem 0 0">escolhe uma pose, define a pausa (ms) a seguir e "+ passo"; repete e guarda. A anima&ccedil;&atilde;o vai pose a pose por dead reckoning; STOP TUDO / qualquer comando manual cancela.</p>
+</section>
+<section class="ck ck-b">
+<div class="hd"><b>Guardadas</b></div>
+<div class="list" id="al"></div>
 </section>
 </div>
-<div class="bottom"><button id="sa">STOP TUDO</button><button class="primary" id="hh">HOME</button></div>
+<div id="gst">a executar&hellip; (STOP TUDO cancela)</div>
 <p class="note">teclado: &larr;/&rarr; base &middot; q/a + w/s juntas &middot; e/d garra &middot; espa&ccedil;o = stop</p>
+</main>
+<div class="bottom"><button id="sa">STOP TUDO</button><button id="hh">HOME</button></div>
 <script>
 const $=x=>document.getElementById(x);
 let CFG=[],MOT=[],WSP=81,CH='?',ws=null,ok=false,T0=0,RTT='';
 let HB={},KEY={},KMAP={},GK={};
 let SPD=parseInt(localStorage.larmspd||'60');
-let POSES=[],NM={},ANIMS=[],AS=[];
+let POSES=[],NM={},ANIMS=[],AS=[],HOMEP={},OPENP='',OPENA='';
 function pill(){const p=$('pill');p.className=ok?'ok':'';
   $('st').textContent=ok?('ligado \\u00b7 ch'+CH+(RTT?' \\u00b7 '+RTT:'')):'sem WS \\u00b7 modo HTTP';}
 function wsConnect(){
@@ -968,7 +1108,8 @@ function wsConnect(){
     ws.onopen=()=>{ok=true;RTT='';pill();};
     ws.onclose=()=>{ok=false;pill();setTimeout(wsConnect,1200);};
     ws.onerror=()=>{try{ws.close();}catch(e){}};
-    ws.onmessage=()=>{if(T0){RTT=Math.round(performance.now()-T0)+'ms';pill();T0=0;}};
+    ws.onmessage=ev=>{if(T0){RTT=Math.round(performance.now()-T0)+'ms';pill();T0=0;}
+      if(ev.data&&ev.data.length>1){try{drawCp(JSON.parse(ev.data.slice(1)));}catch(_){}}};
   }catch(e){setTimeout(wsConnect,1200);}}
 function tx(s){if(ok){try{T0=performance.now();ws.send(s);return true;}catch(e){}}return false;}
 setInterval(()=>{for(const k in HB)HB[k]();},300);  /* heartbeat: renova expiry no S3 */
@@ -984,8 +1125,8 @@ function hold(id,msg,stopMsg,fb,fbStop){const el=$(id);if(!el)return;
   KEY[id]={down:()=>down(null),up:end};}
 function stopAll(){if(!tx('s'))fetch('/app/larm/stopall').catch(()=>{});
   for(const k in HB){delete HB[k];const el=$(k);if(el)el.classList.remove('on');}}
-function row(n,id,hint){return '<div class="ctl"><div class="hd"><b>'+n+'</b><span class="hint">'+(hint||'')+'</span></div>'+
-  '<div class="btns"><button id="'+id+'l">&#9664;</button><button class="stp" id="'+id+'s">&#9632;</button><button id="'+id+'r">&#9654;</button></div></div>';}
+function row(n,id,hint,ck){return '<div class="ck '+ck+'"><div class="hd"><b>'+n+'</b><span class="hint">'+(hint||'')+'</span></div>'+
+  '<div class="btns"><button id="'+id+'l">&#9664;</button><button id="'+id+'r">&#9654;</button></div></div>';}
 let _cT=0,_cTo=null;
 function clawSend(i,v){const go=()=>{_cT=performance.now();
     if(!tx('p,'+i+','+v))fetch('/app/larm/move?idx='+i+'&angle='+v).catch(()=>{});};
@@ -999,10 +1140,10 @@ function render(){
   NM={};MOT.forEach(m=>NM['m'+m.idx]=m.name);
   CFG.forEach(s=>NM[(s.type==='cont'?'s':'p')+s.idx]=s.name);
   let h='';
-  MOT.forEach(m=>{h+=row(m.name,'b'+m.idx,'gira');});
-  CFG.forEach(s=>{if(s.type==='cont')h+=row(s.name,'j'+s.idx,'junta');});
+  MOT.forEach(m=>{h+=row(m.name,'b'+m.idx,'gira','ck-c');});
+  CFG.forEach(s=>{if(s.type==='cont')h+=row(s.name,'j'+s.idx,'junta','ck-b');});
   CFG.forEach(s=>{if(s.type==='pos'){
-    h+='<div class="ctl"><div class="hd"><b>'+s.name+'</b><span><span class="val" id="gv'+s.idx+'">'+s.home+'</span>&deg;</span></div>'+
+    h+='<div class="ck ck-o"><div class="hd"><b>'+s.name+'</b><span><span class="val" id="gv'+s.idx+'">'+s.home+'</span>&deg;</span></div>'+
     '<div class="btns"><button id="gc'+s.idx+'">fechar</button><button id="go'+s.idx+'">abrir</button></div>'+
     '<input type=range id="gsl'+s.idx+'" min='+s.min+' max='+s.max+' value='+s.home+'>'+'</div>';}});
   $('ctl').innerHTML=h;
@@ -1017,8 +1158,7 @@ function render(){
       ()=>fetch('/app/larm/motor?idx='+i+'&pct=0').catch(()=>{}));
     hold('b'+i+'r',()=>'b,'+i+',1,'+SPD,'b,'+i+',0',
       ()=>fetch('/app/larm/motor?idx='+i+'&pct='+SPD+'&ms=500').catch(()=>{}),
-      ()=>fetch('/app/larm/motor?idx='+i+'&pct=0').catch(()=>{}));
-    $('b'+i+'s').addEventListener('click',()=>{if(!tx('b,'+i+',0'))fetch('/app/larm/motor?idx='+i+'&pct=0').catch(()=>{});});});
+      ()=>fetch('/app/larm/motor?idx='+i+'&pct=0').catch(()=>{}));});
   CFG.forEach(s=>{const i=s.idx;
     if(s.type==='cont'){
       hold('j'+i+'l',()=>'v,'+i+',-1,'+SPD,'v,'+i+',0',
@@ -1027,7 +1167,6 @@ function render(){
       hold('j'+i+'r',()=>'v,'+i+',1,'+SPD,'v,'+i+',0',
         ()=>fetch('/app/larm/move?idx='+i+'&angle='+vAng(s,1)+'&ms=500').catch(()=>{}),
         ()=>fetch('/app/larm/stop?idx='+i).catch(()=>{}));
-      $('j'+i+'s').addEventListener('click',()=>{if(!tx('v,'+i+',0'))fetch('/app/larm/stop?idx='+i).catch(()=>{});});
     }else{
       const sl=$('gsl'+i),gv=$('gv'+i);
       const setv=v=>{v=Math.max(s.min,Math.min(s.max,v));sl.value=v;gv.textContent=v;clawSend(i,v);};
@@ -1052,58 +1191,99 @@ document.addEventListener('keydown',e=>{
 document.addEventListener('keyup',e=>{if(typing(e))return;
   const id=KMAP[e.code];if(id&&KEY[id])KEY[id].up();});
 document.addEventListener('visibilitychange',()=>{if(document.hidden)stopAll();});
+async function jget(u){try{const r=await(await fetch(u)).json();
+  if(!r.ok)alert('erro: '+(r.err||'?'));return r;}catch(e){alert('sem liga\\u00e7\\u00e3o');return {ok:false};}}
+async function jpost(u,body){try{const r=await(await fetch(u,{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  if(!r.ok)alert('erro: '+(r.err||'?'));return r;}catch(e){alert('sem liga\\u00e7\\u00e3o');return {ok:false};}}
+function kvHtml(p){return '<div class="kv">'+Object.keys(p).sort().map(k=>
+  '<label>'+(NM[k]||k)+'<input data-k="'+k+'" value="'+p[k]+'" inputmode="decimal"></label>').join('')+'</div>'+
+  '<div class="prow"><button class="kvs">guardar valores</button></div>';}
+function bindKv(el,save){el.querySelector('.kvs').onclick=()=>{
+  const vals={};el.querySelectorAll('input[data-k]').forEach(i=>{
+    const v=parseFloat(i.value);if(!isNaN(v))vals[i.dataset.k]=v;});
+  save(vals);};}
 function drawPoses(){
-  $('pl').innerHTML=POSES.map(p=>'<button data-p="'+p+'">&#9654; '+p+'</button><button class="del" data-d="'+p+'">&times;</button>').join('');
-  $('pl').querySelectorAll('button[data-p]').forEach(b=>b.addEventListener('click',()=>
-    fetch('/app/larm/posego?name='+encodeURIComponent(b.dataset.p)).then(stPoll).catch(()=>{})));
-  $('pl').querySelectorAll('button[data-d]').forEach(b=>b.addEventListener('click',()=>{
-    if(confirm('apagar pose "'+b.dataset.d+'"?'))
-      fetch('/app/larm/posedel?name='+encodeURIComponent(b.dataset.d)).then(stPoll).catch(()=>{});}));
+  $('pl').innerHTML=POSES.map(p=>{
+    let h='<div class="li"><button data-p="'+p+'">&#9654;</button><b>'+p+'</b>'+
+      '<button class="sm" data-e="'+p+'">'+(OPENP===p?'fechar':'editar')+'</button>'+
+      '<button class="sm" data-d="'+p+'">&times;</button></div>';
+    if(OPENP===p)h+='<div class="dt" id="pdt">&hellip;</div>';
+    return h;}).join('')||'<p class="note">sem poses &mdash; p&otilde;e o bra&ccedil;o em posi&ccedil;&atilde;o e "guardar atual"</p>';
+  $('pl').querySelectorAll('button[data-p]').forEach(b=>b.onclick=()=>jget('/app/larm/posego?name='+encodeURIComponent(b.dataset.p)).then(stPoll));
+  $('pl').querySelectorAll('button[data-e]').forEach(b=>b.onclick=()=>{
+    OPENP=OPENP===b.dataset.e?'':b.dataset.e;drawPoses();});
+  $('pl').querySelectorAll('button[data-d]').forEach(b=>b.onclick=()=>{
+    if(confirm('apagar pose "'+b.dataset.d+'"?')){if(OPENP===b.dataset.d)OPENP='';
+      jget('/app/larm/posedel?name='+encodeURIComponent(b.dataset.d)).then(stPoll);}});
+  if(OPENP)loadPdt();
   const v=$('asel').value;
   $('asel').innerHTML=POSES.map(p=>'<option>'+p+'</option>').join('');
   if(POSES.indexOf(v)>=0)$('asel').value=v;}
+async function loadPdt(){try{
+  const j=await(await fetch('/app/larm/poseget?name='+encodeURIComponent(OPENP))).json();
+  const el=$('pdt');if(!j.ok||!el)return;
+  el.innerHTML=kvHtml(j.pose);
+  bindKv(el,vals=>jpost('/app/larm/posesave',{name:j.name,vals:vals}).then(r=>{if(r.ok){OPENP='';drawPoses();}}));}catch(_){}}
 function drawSteps(){$('asteps').textContent=AS.length?
   AS.map(s=>s.p+' ('+s.d+'ms)').join(' \\u2192 '):'(sem passos)';}
 function drawAnims(){
-  $('al').innerHTML=ANIMS.map(a=>'<button data-a="'+a+'">&#9654; '+a+'</button><button class="del" data-x="'+a+'">&times;</button>').join('');
-  $('al').querySelectorAll('button[data-a]').forEach(b=>b.addEventListener('click',()=>
-    fetch('/app/larm/animgo?name='+encodeURIComponent(b.dataset.a)).then(stPoll).catch(()=>{})));
-  $('al').querySelectorAll('button[data-x]').forEach(b=>b.addEventListener('click',()=>{
-    if(confirm('apagar anima\\u00e7\\u00e3o "'+b.dataset.x+'"?'))
-      fetch('/app/larm/animdel?name='+encodeURIComponent(b.dataset.x)).then(stPoll).catch(()=>{});}));}
+  $('al').innerHTML=ANIMS.map(a=>{
+    let h='<div class="li"><button data-a="'+a+'">&#9654;</button><b>'+a+'</b>'+
+      '<button class="sm" data-e="'+a+'">'+(OPENA===a?'fechar':'ver')+'</button>'+
+      '<button class="sm" data-x="'+a+'">&times;</button></div>';
+    if(OPENA===a)h+='<div class="dt" id="adt">&hellip;</div>';
+    return h;}).join('')||'<p class="note">sem anima&ccedil;&otilde;es &mdash; cria uma em cima</p>';
+  $('al').querySelectorAll('button[data-a]').forEach(b=>b.onclick=()=>jget('/app/larm/animgo?name='+encodeURIComponent(b.dataset.a)).then(stPoll));
+  $('al').querySelectorAll('button[data-e]').forEach(b=>b.onclick=()=>{
+    OPENA=OPENA===b.dataset.e?'':b.dataset.e;drawAnims();});
+  $('al').querySelectorAll('button[data-x]').forEach(b=>b.onclick=()=>{
+    if(confirm('apagar anima\\u00e7\\u00e3o "'+b.dataset.x+'"?')){if(OPENA===b.dataset.x)OPENA='';
+      jget('/app/larm/animdel?name='+encodeURIComponent(b.dataset.x)).then(stPoll);}});
+  if(OPENA)loadAdt();}
+async function loadAdt(){try{
+  const j=await(await fetch('/app/larm/animget?name='+encodeURIComponent(OPENA))).json();
+  const el=$('adt');if(!j.ok||!el)return;
+  el.innerHTML='<div class="mono" style="margin-top:0">'+
+    j.steps.map(s=>s.p+' <span style="opacity:.55">('+s.d+'ms)</span>').join(' \\u2192 ')+'</div>';}catch(_){}}
+function drawCp(est){const cp='agora: '+Object.keys(est).sort().map(k=>(NM[k]||k)+' <b>'+Math.round(est[k])+'</b>').join(' \\u00b7 ');
+  $('cpos').innerHTML=cp;$('cpos2').innerHTML=cp;}
 async function stPoll(){try{
   const j=await(await fetch('/app/larm/state')).json();
-  $('est').textContent=Object.keys(j.est).sort().map(k=>(NM[k]||k)+' '+Math.round(j.est[k])).join(' \\u00b7 ');
+  HOMEP=j.home||{};
+  drawCp(j.est);
   $('gst').style.display=(j.goto||j.anim)?'block':'none';
   $('gst').textContent=j.anim?'anima\\u00e7\\u00e3o a correr\\u2026 (STOP TUDO cancela)':'a ir para a pose\\u2026 (STOP TUDO cancela)';
-  const rg=j.range||{};
-  $('rl').innerHTML=Object.keys(j.est).sort().filter(k=>k[0]!=='p').map(k=>{
-    const r=rg[k];
-    return (NM[k]||k)+': '+Math.round(j.est[k])+(r==null?' <span style="color:var(--muted)">(sem FIM marcado)</span>':' &middot; curso 0..'+Math.round(r));}).join('<br>');
   const s=JSON.stringify(j.poses);
   if(s!==JSON.stringify(POSES)){POSES=j.poses;drawPoses();}
   const a=JSON.stringify(j.anims||[]);
   if(a!==JSON.stringify(ANIMS)){ANIMS=j.anims||[];drawAnims();}
 }catch(_){}}
-$('pz').addEventListener('click',()=>fetch('/app/larm/zero').then(stPoll).catch(()=>{}));
 $('ps').addEventListener('click',()=>{const n=$('pn').value.trim();if(!n)return;
-  fetch('/app/larm/posesave?name='+encodeURIComponent(n)).then(()=>{$('pn').value='';stPoll();}).catch(()=>{});});
+  jget('/app/larm/posesave?name='+encodeURIComponent(n)).then(r=>{if(r.ok)$('pn').value='';stPoll();});});
+$('hsync').addEventListener('click',()=>jget('/app/larm/homesync').then(stPoll));
+$('hset').addEventListener('click',()=>{
+  if(confirm('a pose HOME passa a ser a posi\\u00e7\\u00e3o ATUAL?'))jget('/app/larm/homeset').then(stPoll);});
+$('hedit').addEventListener('click',()=>{const d=$('hdt');
+  if(d.style.display!=='none'){d.style.display='none';return;}
+  if(!Object.keys(HOMEP).length){alert('home ainda n\\u00e3o definido \\u2014 usa "home = aqui"');return;}
+  d.style.display='block';
+  d.innerHTML=kvHtml(HOMEP);
+  bindKv(d,vals=>jpost('/app/larm/homesave',{vals:vals}).then(r=>{if(r.ok)d.style.display='none';stPoll();}));});
 $('aadd').addEventListener('click',()=>{const p=$('asel').value;if(!p)return;
   if(AS.length>=20){alert('max 20 passos');return;}
   AS.push({p:p,d:Math.max(0,Math.min(10000,parseInt($('ad').value)||0))});drawSteps();});
 $('aclr').addEventListener('click',()=>{AS=[];drawSteps();});
 $('asave').addEventListener('click',()=>{const n=$('an').value.trim();
   if(!n||!AS.length)return;
-  fetch('/app/larm/animsave',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name:n,steps:AS})}).then(()=>{$('an').value='';AS=[];drawSteps();stPoll();}).catch(()=>{});});
-$('c0').addEventListener('click',()=>fetch('/app/larm/calset?which=min').then(stPoll).catch(()=>{}));
-$('c1').addEventListener('click',()=>fetch('/app/larm/calset?which=max').then(stPoll).catch(()=>{}));
-$('cx').addEventListener('click',()=>{if(confirm('limpar a calibra\\u00e7\\u00e3o do curso?'))
-  fetch('/app/larm/calclear').then(stPoll).catch(()=>{});});
+  jpost('/app/larm/animsave',{name:n,steps:AS}).then(r=>{
+    if(r.ok){$('an').value='';AS=[];drawSteps();}stPoll();});});
 function tab(n){for(let i=0;i<3;i++){$('tb'+i).className=i===n?'on':'';$('tab'+i).className=i===n?'tab on':'tab';}
   localStorage.larmtab=n;}
 [0,1,2].forEach(i=>$('tb'+i).addEventListener('click',()=>tab(i)));
-tab(parseInt(localStorage.larmtab||'0')||0);
-setInterval(stPoll,800);
+tab(parseInt((location.hash||'#').slice(1)||(location.search.match(/t=(\\d)/)||[])[1]||localStorage.larmtab||'0')||0);
+/* poll lento e SUSPENSO enquanto seguras um botao (as coords vem pelo WS;
+   evita colisoes HTTP<->WS no loop do S3 = ping baixo durante o controlo) */
+setInterval(()=>{if(!Object.keys(HB).length)stPoll();},2000);
 load();wsConnect();stPoll();
-</script>"""
+</script></body></html>"""

@@ -1,6 +1,7 @@
 # GUIA — L-ONE WiFi Control (como tudo funciona)
 
 Visão rápida do sistema para explorares. Detalhe técnico fino → `CLAUDE.md`.
+Lições aprendidas (técnicas e de processo) → `LESSONS.md`.
 
 ## A ideia
 
@@ -59,29 +60,33 @@ Segurança em camadas — nada fica a rodar sozinho:
   acende), largar = parar. ■ = stop da fila.
 - **Garra**: fechar/abrir + slider com o valor em graus.
 - **Velocidade**: lento / médio / rápido (afeta juntas e base; fica guardado).
-A página tem **3 tabs** — Controlo / Poses / Calibração — com STOP TUDO e HOME
-sempre visíveis.
+A página tem **3 tabs** — Controlo / Poses / Animações — com STOP TUDO e HOME
+sempre visíveis em baixo. Design retro (creme/azul/laranja sobre preto).
 
-- **STOP TUDO** (vermelho) e **HOME** (stop + garra na pose inicial).
-- **Calibração** (tab própria): marca o **INÍCIO** do curso (braço recolhido,
-  = o zero) e o **FIM** (esticado). O "ir para pose" passa a não sair de
-  0..FIM nos eixos calibrados. Fica guardado; após reiniciar o S3 basta voltar
-  à mesma posição de início e marcar só o INÍCIO.
-- **Poses (dead reckoning)**: o S3 *estima* onde cada eixo está integrando a
-  velocidade que mandou × tempo. Setup humano: levas o braço à mão a uma posição
-  de referência → **ZERO aqui**. Depois moves e **guardas poses** com nome; o
-  botão ▶ volta lá sozinho (loop fechado sobre a estimativa). A estimativa
-  **deriva** com o uso (sem sensores!) — re-zera quando precisares; reiniciar o
-  S3 perde-a. Qualquer comando manual / STOP TUDO cancela um "ir para pose".
-- **Animações**: encadeiam poses guardadas com pausas. Na tab Poses: escolhe
-  pose → pausa (ms) → "+ passo" → repete → dá nome e Guarda. ▶ corre pose a
-  pose. Persiste no S3; cancela com STOP TUDO / qualquer comando manual.
-- **HOME**: se existir uma pose chamada **`ground`** (braço recolhido + garra
-  fechada), HOME vai até ela por dead reckoning; senão só pára + garra à pose
-  inicial.
+- **Controlo**: ◀/▶ hold-to-move por eixo (largar = parar; não há botão ■ —
+  qualquer comando pára), garra com fechar/abrir + slider, velocidade.
+- **Poses** (dead reckoning: o S3 *estima* onde cada eixo está integrando a
+  velocidade comandada × tempo):
+  - **Home** (card próprio): a pose de arranque, configurável. "home = aqui"
+    define-a; **"ESTOU no home"** = puseste o braço fisicamente nela (após
+    reiniciar o S3 ou quando a estimativa derivou) e o software adota essas
+    coordenadas — conserta todas as poses de uma vez (referencial comum).
+    "editar" deixa afinar os valores à mão. O botão HOME vai para esta pose.
+  - **Poses**: lista ordenada; ▶ vai lá (loop fechado sobre a estimativa),
+    "editar" mostra e deixa alterar os valores de cada eixo, × apaga.
+    "guardar atual" grava a posição corrente com nome.
+- **Animações**: builder (pose → pausa ms → "+ passo" → guardar) + lista das
+  guardadas com "ver" (mostra os passos) e ×. Corre pose a pose; STOP TUDO ou
+  qualquer comando manual cancela.
+- **A base não volta ao mesmo sítio?** Dois remédios automáticos: ganho
+  direcional aprendido (`/callearn?axis=m1` após ida-e-volta; o do Trinity
+  deu 0.772) e chegada sempre no sentido ▶ com abrandamento perto do alvo
+  (mata a folga das engrenagens). Funciona também para juntas via API
+  (`axis=s1|s2`) — útil porque levantar custa mais do que descer.
 - Nota de força: o ombro/cotovelo só **levantam** em rápido (em lento/médio não
-  têm binário) — o "ir para pose" já usa 100% nas juntas por isso. A base em
+  têm binário) — o "ir para pose" usa 100% nas juntas por isso. A base em
   lento dá jeito para afinar a rotação.
+- Erros de gravação aparecem em alerta (nada falha em silêncio).
 - Pílula no topo: verde = WebSocket ligado, mostra canal e RTT.
 - No PC dá para usar o **teclado**: ←/→ base, q/a e w/s juntas, e/d garra,
   espaço = STOP. Esconder o separador também pára tudo.
@@ -98,15 +103,17 @@ sempre visíveis.
 | `GET /app/larm/home` | pára tudo + garra na pose inicial |
 | `POST /app/larm/seq` | corre uma animação (lista de passos) |
 | `GET /app/larm/seqstop` | pára a animação |
-| `GET /app/larm/state` | posição estimada + lista de poses + goto a correr? |
-| `GET /app/larm/zero` | "estás na referência": estimativa de todos os eixos = 0 |
+| `GET /app/larm/state` | estimativa, home, poses, anims, goto/anim a correr |
+| `GET /app/larm/homeset` | pose HOME = posição atual |
+| `GET /app/larm/homesync` | "estou fisicamente no home" → adota as coordenadas |
+| `POST /app/larm/homesave` | edita o home: `{"vals":{"s1":u,...}}` |
 | `GET /app/larm/posesave?name=` | guarda a pose atual (estimativa + garra) |
-| `GET /app/larm/posego?name=` | vai para a pose (loop fechado, teto 25s) |
-| `GET /app/larm/posedel?name=` | apaga a pose |
-| `GET /app/larm/calset?which=min\|max` | marca início (=zero) / fim do curso |
-| `GET /app/larm/calclear` | limpa a calibração do curso |
+| `POST /app/larm/posesave` | edita: `{"name":x,"vals":{...}}` |
+| `GET /app/larm/poseget?name=` / `posego` / `posedel` | ler / ir / apagar pose |
+| `GET /app/larm/zero` | estimativa de todos os eixos = 0 (legado; usa homesync) |
+| `GET /app/larm/callearn?axis=m1\|s1\|s2` | aprende ganho direcional (ida-e-volta) |
 | `POST /app/larm/animsave` | guarda animação `{"name":x,"steps":[{"p":pose,"d":ms}]}` |
-| `GET /app/larm/animgo?name=` / `animdel?name=` | corre / apaga animação |
+| `GET /app/larm/animget?name=` / `animgo` / `animdel` | ver / correr / apagar |
 | `POST /app/larm/goto` | alvo direto `{"s1":u,"s2":u,"m1":u,"p3":ang}` (fase AI) |
 
 Coleção Postman pronta: `host/larm.postman_collection.json`.
