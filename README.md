@@ -90,3 +90,7 @@ Ctrl-C always stops the arm on exit.
 ## Stack
 
 MicroPython · ESP32-S3 / ESP32-C3 · ESP-NOW · WebSocket · OpenCV (ArUco)
+
+## License
+
+[MIT](LICENSE)
